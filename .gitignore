@@ -1,0 +1,26 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python cache/artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+**/*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# Local vector/db artifacts
+vector_db/
+dashboard/vector_db/
+
+# OS/editor
+.DS_Store
+.vscode/*.code-workspace

@@ -1,0 +1,16 @@
+docling
+faiss-cpu
+langchain
+langchain-chroma
+langchain-community
+langchain-core
+langchain-ollama
+langchain-text-splitters
+pdf2image
+Pillow
+pymupdf
+python-dotenv
+streamlit
+matplotlib
+seaborn
+yfinance
