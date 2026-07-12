@@ -1,11 +1,25 @@
-docling
+# Requirements file for the project
+# Generic dependencies
+pandas
+numpy
+scipy
+matplotlib
+seaborn
+statsmodels
+# ML libraries
+scikit-learn
+torch
 faiss-cpu
+chromadb
+# Agent and LLM libraries   
+autogen
 langchain
 langchain-chroma
 langchain-community
 langchain-core
 langchain-ollama
 langchain-text-splitters
+docling
 pdf2image
 Pillow
 pymupdf
@@ -13,4 +27,7 @@ python-dotenv
 streamlit
 matplotlib
 seaborn
+# Tools
 yfinance
+ipywidgets
+ipykernel
