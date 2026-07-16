@@ -1,0 +1,5 @@
+pandas>=2.2.0
+numpy>=1.26.0
+rich>=13.7.0
+yfinance>=0.2.40
+litellm>=1.50.0

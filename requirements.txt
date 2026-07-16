@@ -11,7 +11,9 @@ accelerate==1.13.0
 aiohappyeyeballs==2.6.1
     # via aiohttp
 aiohttp==3.13.5
-    # via langchain-community
+    # via
+    #   langchain-community
+    #   litellm
 aiosignal==1.4.0
     # via aiohttp
 altair==6.0.0
@@ -27,6 +29,10 @@ anyio==4.13.0
     #   autogen
     #   fast-depends
     #   httpx
+    #   mcp
+    #   openai
+    #   sse-starlette
+    #   starlette
     #   watchfiles
 appnope==0.1.4
     # via ipykernel
@@ -61,7 +67,9 @@ certifi==2026.2.25
     #   kubernetes
     #   requests
 cffi==2.0.0
-    # via curl-cffi
+    # via
+    #   cryptography
+    #   curl-cffi
 charset-normalizer==3.4.7
     # via requests
 chromadb==1.5.7
@@ -70,6 +78,7 @@ chromadb==1.5.7
     #   langchain-chroma
 click==8.3.2
     # via
+    #   litellm
     #   ocrmac
     #   streamlit
     #   typer
@@ -84,6 +93,8 @@ comm==0.2.3
     #   ipywidgets
 contourpy==1.3.3
     # via matplotlib
+cryptography==49.0.0
+    # via pyjwt
 curl-cffi==0.15.0
     # via yfinance
 cycler==0.12.1
@@ -100,6 +111,8 @@ defusedxml==0.7.1
     #   docling-core
 dill==0.4.1
     # via multiprocess
+distro==1.9.0
+    # via openai
 docling==2.89.0
     # via -r requirements.in
 docling-core[chunking]==2.73.0
@@ -123,6 +136,8 @@ faker==40.13.0
     # via polyfactory
 fast-depends[pydantic]==3.0.8
     # via autogen
+fastuuid==0.14.0
+    # via litellm
 filelock==3.28.0
     # via
     #   huggingface-hub
@@ -171,9 +186,14 @@ httpx==0.28.1
     #   huggingface-hub
     #   langgraph-sdk
     #   langsmith
+    #   litellm
+    #   mcp
     #   ollama
+    #   openai
 httpx-sse==0.4.3
-    # via langchain-community
+    # via
+    #   langchain-community
+    #   mcp
 huggingface-hub==1.11.0
     # via
     #   accelerate
@@ -190,7 +210,9 @@ idna==3.11
     #   requests
     #   yarl
 importlib-metadata==8.7.1
-    # via opentelemetry-api
+    # via
+    #   litellm
+    #   opentelemetry-api
 importlib-resources==7.1.0
     # via chromadb
 ipykernel==7.3.0
@@ -208,8 +230,11 @@ jedi==0.20.0
 jinja2==3.1.6
     # via
     #   altair
+    #   litellm
     #   pydeck
     #   torch
+jiter==0.16.0
+    # via openai
 joblib==1.5.3
     # via scikit-learn
 jsonlines==4.0.0
@@ -225,6 +250,8 @@ jsonschema==4.26.0
     #   altair
     #   chromadb
     #   docling-core
+    #   litellm
+    #   mcp
 jsonschema-specifications==2025.9.1
     # via jsonschema
 jupyter-client==8.9.1
@@ -282,6 +309,8 @@ langsmith==0.7.32
     #   langchain-core
 latex2mathml==3.81.0
     # via docling-core
+litellm==1.92.0
+    # via -r requirements.in
 lxml==6.0.4
     # via
     #   docling
@@ -303,6 +332,8 @@ matplotlib-inline==0.2.2
     # via
     #   ipykernel
     #   ipython
+mcp==1.28.1
+    # via -r requirements.in
 mdurl==0.1.2
     # via markdown-it-py
 mmh3==5.2.1
@@ -366,6 +397,8 @@ omegaconf==2.3.0
     # via rapidocr
 onnxruntime==1.23.2
     # via chromadb
+openai==2.45.0
+    # via litellm
 opencv-python==4.13.0.92
     # via rapidocr
 openpyxl==3.1.5
@@ -502,7 +535,10 @@ pydantic==2.13.1
     #   langchain-core
     #   langgraph
     #   langsmith
+    #   litellm
+    #   mcp
     #   ollama
+    #   openai
     #   pydantic-settings
 pydantic-core==2.46.1
     # via pydantic
@@ -511,6 +547,7 @@ pydantic-settings==2.13.1
     #   chromadb
     #   docling
     #   langchain-community
+    #   mcp
 pydeck==0.9.2
     # via streamlit
 pygments==2.20.0
@@ -519,6 +556,8 @@ pygments==2.20.0
     #   ipython-pygments-lexers
     #   mpire
     #   rich
+pyjwt[crypto]==2.13.0
+    # via mcp
 pylatexenc==2.10
     # via docling
 pymupdf==1.27.2.2
@@ -560,8 +599,11 @@ python-dotenv==1.2.2
     # via
     #   -r requirements.in
     #   autogen
+    #   litellm
     #   pydantic-settings
     #   uvicorn
+python-multipart==0.0.32
+    # via mcp
 python-pptx==1.0.2
     # via docling
 pytz==2026.1.post1
@@ -653,14 +695,22 @@ six==1.17.0
     #   rapidocr
 smmap==5.0.3
     # via gitdb
+sniffio==1.3.1
+    # via openai
 soupsieve==2.8.3
     # via beautifulsoup4
 sqlalchemy==2.0.49
     # via
     #   langchain-classic
     #   langchain-community
+sse-starlette==3.4.5
+    # via mcp
 stack-data==0.6.3
     # via ipython
+starlette==1.3.1
+    # via
+    #   mcp
+    #   sse-starlette
 statsmodels==0.14.6
     # via -r requirements.in
 streamlit==1.56.0
@@ -684,10 +734,13 @@ termcolor==3.3.0
 threadpoolctl==3.6.0
     # via scikit-learn
 tiktoken==0.13.0
-    # via autogen
+    # via
+    #   autogen
+    #   litellm
 tokenizers==0.22.2
     # via
     #   chromadb
+    #   litellm
     #   transformers
 toml==0.10.2
     # via streamlit
@@ -715,6 +768,7 @@ tqdm==4.67.3
     #   docling-ibm-models
     #   huggingface-hub
     #   mpire
+    #   openai
     #   rapidocr
     #   semchunk
     #   transformers
@@ -761,6 +815,8 @@ typing-extensions==4.15.0
     #   ipython
     #   jupyter-client
     #   langchain-core
+    #   mcp
+    #   openai
     #   opentelemetry-api
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-sdk
@@ -772,6 +828,7 @@ typing-extensions==4.15.0
     #   python-pptx
     #   referencing
     #   sqlalchemy
+    #   starlette
     #   streamlit
     #   torch
     #   typing-inspect
@@ -780,6 +837,7 @@ typing-inspect==0.9.0
     # via dataclasses-json
 typing-inspection==0.4.2
     # via
+    #   mcp
     #   pydantic
     #   pydantic-settings
 urllib3==2.6.3
@@ -791,7 +849,9 @@ uuid-utils==0.14.1
     #   langchain-core
     #   langsmith
 uvicorn[standard]==0.44.0
-    # via chromadb
+    # via
+    #   chromadb
+    #   mcp
 uvloop==0.22.1
     # via uvicorn
 watchfiles==1.1.1

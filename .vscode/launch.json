@@ -13,6 +13,41 @@
             "cwd": "${workspaceFolder}/rag_data_analysis",
             "console": "integratedTerminal",
             "justMyCode": false
+        },
+        {
+            "name": "Time Series: Autogen CLI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "time_series.autogen_framework.cli",
+            "args": [
+                "--ticker", "AAPL",
+                "--start", "2024-01-01",
+                "--end", "2024-12-31",
+                "--yahoo-mode", "stub",
+                "--llm-client", "ollama",
+                "--llm-model", "gemma4"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Time Series: LangChain CLI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "time_series.langchain_framework.cli",
+            "args": [
+                "--ticker", "AAPL",
+                "--start", "2024-01-01",
+                "--end", "2024-12-31",
+                "--yahoo-mode", "stub",
+                "--llm-client", "ollama",
+                "--llm-model", "gemma4",
+                // "--non-interactive", 
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }

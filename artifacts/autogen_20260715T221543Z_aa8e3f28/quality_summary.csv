@@ -1,0 +1,4 @@
+source,rows,missing_close,duplicate_dates,coverage_pct,start_date,end_date
+bloomberg,262,2,0,99.23664122137404,2024-01-01,2024-12-31
+reuters,264,7,2,97.34848484848484,2024-01-01,2024-12-31
+yahoo,267,21,5,92.13483146067416,2024-01-01,2024-12-31
