@@ -20,6 +20,7 @@ dist/
 # Local vector/db artifacts
 vector_db/
 dashboard/vector_db/
+tutorials/rag/*vector_db*/
 
 # OS/editor
 .DS_Store
