@@ -11,6 +11,10 @@ Key design:
     ``LLMRequest.callbacks`` field so errors are captured automatically.
   - The ReAct loop is unchanged in structure — only the LLM call and
     tool execution paths were swapped.
+  - Delegation uses a dedicated ``delegate_to_agent`` tool, separate from
+    ``request_human_input``, to prevent the infinite loop that occurred
+    when both delegation and user-input pausing were conflated.
+  - A visited‑agents set prevents re-entering the same agent recursively.
 """
 
 from __future__ import annotations
@@ -130,33 +134,39 @@ def _execute_tool(
     """Execute a LangChain tool by name, returning a JSON result string.
 
     ``request_human_input`` is special‑cased — it triggers the callback
-    handler instead of running a function.
+    handler instead of running a function.  ``delegate_to_agent`` is also
+    special‑cased to return a delegation result that the ReAct loop
+    interprets to switch to a specialist agent.
     """
     tool_name = tool_call["name"]
+
+    # Special case: delegate_to_agent — emit delegation result
+    if tool_name == "delegate_to_agent":
+        args = tool_call.get("arguments", {})
+        agent_target = args.get("agent_name", "")
+        request = args.get("request", "")
+        if not agent_target:
+            return json.dumps({
+                "status": "error",
+                "message": "Missing 'agent_name' in delegate_to_agent arguments.",
+            })
+        if not get_agent(agent_target):
+            return json.dumps({
+                "status": "error",
+                "message": f"Unknown agent: {agent_target}. "
+                           f"Must be one of: CarBookingAgent, AirTicketAgent, HotelReservationAgent.",
+            })
+        return json.dumps({
+            "status": "delegating",
+            "delegate_to": agent_target,
+            "original_request": request,
+        })
 
     # Special case: request_human_input is handled by the callback system
     if tool_name == "request_human_input":
         args = tool_call.get("arguments", {})
         ctx = args.get("context", {})
         ctx["agent"] = agent_name
-        delegate_to = ctx.get("delegate_to")
-
-        if delegate_to:
-            return json.dumps({
-                "status": "delegating",
-                "delegate_to": delegate_to,
-                "original_request": ctx.get("original_request", ""),
-                "agent": agent_name,
-            })
-
-        # Orchestrator called request_human_input without delegate_to
-        if agent_name == "Orchestrator":
-            return json.dumps({
-                "status": "must_delegate",
-                "message": "You must delegate to a specialist agent. "
-                           "Use context with delegate_to set to one of: "
-                           "CarBookingAgent, AirTicketAgent, HotelReservationAgent.",
-            })
 
         # Specialist agent needs actual user input: pause the loop
         handler.request_human_input(
@@ -236,6 +246,7 @@ def _react_loop(
     system_prompt: str,
     start_iteration: int = 0,
     max_iterations: int = 10,
+    visited_agents: set[str] | None = None,
 ) -> list[CallbackEvent]:
     """Run the ReAct loop from the given state.
 
@@ -246,12 +257,41 @@ def _react_loop(
         system_prompt: The full ReAct system prompt.
         start_iteration: Which iteration to start from (0 = fresh, >0 = resume).
         max_iterations: Maximum total iterations.
+        visited_agents: Set of agent names already visited in this delegation
+            chain. Used to prevent infinite delegation loops.
 
     Returns:
         Events emitted during this loop segment. The loop pauses when
         ``request_human_input`` is called; the caller must resume by calling
         this function again with updated messages.
     """
+    if visited_agents is None:
+        visited_agents = set()
+
+    # Cycle detection: if we have already run this agent in this chain,
+    # force-complete to prevent infinite loops.
+    if agent.name in visited_agents:
+        logger.warning(
+            "Cycle detected: agent '%s' was already visited. "
+            "Forcing completion to prevent infinite loop.",
+            agent.name,
+        )
+        return [
+            CallbackEvent(
+                CallbackEventType.AGENT_COMPLETED,
+                {
+                    "agent": agent.name,
+                    "result": {
+                        "final_answer": (
+                            f"I already handled this request under {agent.name}. "
+                            "Please provide a new request or clarify."
+                        ),
+                    },
+                },
+            ),
+        ]
+
+    visited_agents.add(agent.name)
     handler.current_agent = agent.name
     events: list[CallbackEvent] = []
 
@@ -296,9 +336,12 @@ def _react_loop(
                                     delegate_to, original_request)
                         delegate_prompt = _build_react_prompt(delegate)
                         delegate_messages = [{"role": "user", "content": original_request}]
+                        # Pass visited_agents through so cycles are detected
                         return _react_loop(
                             delegate, handler, delegate_messages,
-                            delegate_prompt, start_iteration=0, max_iterations=max_iterations,
+                            delegate_prompt, start_iteration=0,
+                            max_iterations=max_iterations,
+                            visited_agents=visited_agents,
                         )
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
@@ -360,18 +403,6 @@ class TravelBookingProcessor:
         agent = get_agent(state.get("agent", "Orchestrator"))
         if not agent:
             agent = get_agent("Orchestrator")
-
-        # Check for delegation from orchestrator context
-        ctx = state.get("context", {})
-        if ctx.get("delegate_to"):
-            delegate = get_agent(ctx["delegate_to"])
-            if delegate:
-                agent = delegate
-                state["messages"] = [
-                    {"role": "user", "content": ctx.get("original_request", user_input)},
-                ]
-                state["system_prompt"] = _build_react_prompt(agent)
-                state["iteration"] = 0
 
         events = _react_loop(
             agent,

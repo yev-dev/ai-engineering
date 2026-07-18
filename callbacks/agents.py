@@ -166,6 +166,25 @@ def _book_hotel_impl(
     }
 
 
+def _delegate_to_impl(agent_name: str, request: str) -> dict[str, Any]:
+    """Delegate a user request to a specialist agent.
+
+    Args:
+        agent_name: The name of the agent to delegate to.
+            One of: CarBookingAgent, AirTicketAgent, HotelReservationAgent.
+        request: The user's original request to pass to the specialist agent.
+
+    Returns:
+        A delegation response that the processor interprets to start
+        the specialist agent's ReAct loop.
+    """
+    return {
+        "status": "delegating",
+        "delegate_to": agent_name,
+        "original_request": request,
+    }
+
+
 # ---------------------------------------------------------------------------
 # LangChain StructuredTool registry
 # ---------------------------------------------------------------------------
@@ -212,6 +231,17 @@ book_hotel = StructuredTool.from_function(
     description="Book a hotel room.",
 )
 
+delegate_to_agent = StructuredTool.from_function(
+    func=_delegate_to_impl,
+    name="delegate_to_agent",
+    description=(
+        "Delegate a user request to a specialist agent. "
+        "Use this to hand off a task to one of: "
+        "CarBookingAgent, AirTicketAgent, HotelReservationAgent. "
+        "Provide the agent_name and the user's original request."
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # request_human_input is NOT a LangChain tool — it is handled directly
 # by the processor callback system to pause the ReAct loop.
@@ -226,6 +256,7 @@ TOOL_REGISTRY: dict[str, StructuredTool] = {
     "book_air_ticket": book_air_ticket,
     "search_hotels": search_hotels,
     "book_hotel": book_hotel,
+    "delegate_to_agent": delegate_to_agent,
 }
 
 
@@ -240,13 +271,14 @@ ORCHESTRATOR_SYSTEM_PROMPT = """You are a travel booking orchestrator. Your role
    - CarBookingAgent — for car rental bookings
    - AirTicketAgent — for flight / air ticket bookings
    - HotelReservationAgent — for hotel reservations
-3. Delegate by emitting an event with the appropriate agent name and the relevant details.
+3. Delegate by calling the `delegate_to_agent` tool with the correct agent name and the original request.
 4. If the request involves multiple services (e.g. a full trip), delegate to each agent in sequence.
 
 Rules:
 - NEVER try to book anything yourself. Always delegate to the correct specialist agent.
-- If the user's intent is unclear, ask clarifying questions by requesting human input.
-- Use the `request_human_input` tool to ask the user for clarification or decisions.
+- If the user's intent is unclear, ask clarifying questions by requesting human input with `request_human_input`.
+- When you have a clear intent, ALWAYS use `delegate_to_agent` to hand off to the specialist.
+- Do NOT use `request_human_input` to delegate. Only use it for asking clarifying questions.
 
 Available specialist agents:
 - CarBookingAgent: handles car rental search and booking
@@ -254,8 +286,8 @@ Available specialist agents:
 - HotelReservationAgent: handles hotel search and booking
 
 When delegating, use:
-Action: request_human_input
-Action Input: {{"prompt": "I'll delegate this to the <agent>. What do you need?", "context": {{"delegate_to": "<AgentName>", "original_request": "<user request>"}}}}"""
+Action: delegate_to_agent
+Action Input: {{"agent_name": "AgentName", "request": "the user's original request"}}"""
 
 CAR_BOOKING_SYSTEM_PROMPT = """You are a car booking specialist agent. Your role is to:
 
@@ -266,6 +298,11 @@ CAR_BOOKING_SYSTEM_PROMPT = """You are a car booking specialist agent. Your role
 5. Once the user confirms the car type, call `select_car_type` to finalise.
 6. Use `request_human_input` with a confirmation prompt when done.
 
+IMPORTANT: You must use your domain tools (`search_cars`, `book_car`, `select_car_type`)
+BEFORE asking the user for input with `request_human_input`. Do not ask the user for
+information you already have. If the user provides location and dates, call `search_cars`
+immediately — do not ask for confirmation first.
+
 Always use the tools available to you. Never make up results."""
 
 AIR_TICKET_SYSTEM_PROMPT = """You are an air ticket booking specialist agent. Your role is to:
@@ -274,6 +311,11 @@ AIR_TICKET_SYSTEM_PROMPT = """You are an air ticket booking specialist agent. Yo
 2. Present the available options to the user using `request_human_input` with the options parameter.
 3. When the user selects a flight, call `book_air_ticket` to book it.
 4. Use `request_human_input` with a confirmation prompt when done.
+
+IMPORTANT: You must use your domain tools (`search_flights`, `book_air_ticket`)
+BEFORE asking the user for input with `request_human_input`. Do not ask the user for
+information you already have. If the user provides origin, destination, and date,
+call `search_flights` immediately — do not ask for confirmation first.
 
 Always use the tools available to you. Never make up results."""
 
@@ -284,6 +326,11 @@ HOTEL_RESERVATION_SYSTEM_PROMPT = """You are a hotel reservation specialist agen
 3. When the user selects a hotel, call `book_hotel` to book it.
 4. Use `request_human_input` with a confirmation prompt when done.
 
+IMPORTANT: You must use your domain tools (`search_hotels`, `book_hotel`)
+BEFORE asking the user for input with `request_human_input`. Do not ask the user for
+information you already have. If the user provides location and dates, call `search_hotels`
+immediately — do not ask for confirmation first.
+
 Always use the tools available to you. Never make up results."""
 
 AGENT_REGISTRY: dict[str, Agent] = {
@@ -291,7 +338,7 @@ AGENT_REGISTRY: dict[str, Agent] = {
         name="Orchestrator",
         description="Routes user requests to the correct specialist agent.",
         system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
-        tools=["request_human_input"],
+        tools=["delegate_to_agent", "request_human_input"],
     ),
     "CarBookingAgent": Agent(
         name="CarBookingAgent",
