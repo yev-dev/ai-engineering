@@ -9,6 +9,7 @@ The handler is the bridge between the ReAct agent loop (processor.py)
 and the user interface (cli.py) — it:
   - Maintains an event queue for agent → UI communication
   - Manages human-in-the-loop state (pause/resume)
+  - Logs all callback events for observability
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
 
     litellm accepts LangChain callback handlers natively — pass an instance
     via ``LLMRequest(callbacks=[handler])`` to receive LLM and tool events.
+
+    All significant operations are logged at INFO level for traceability.
     """
 
     def __init__(self) -> None:
@@ -43,9 +46,15 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
     # -------------------------------------------------------------------
     # Event queue
     # -------------------------------------------------------------------
-
+    
     def emit(self, event: CallbackEvent) -> None:
         """Push an event onto the queue."""
+        logger.info(
+            "EVENT [%s] %s | agent=%s",
+            event.type.value,
+            event.payload.get("message", event.payload.get("prompt", "")),
+            event.payload.get("agent", "unknown"),
+        )
         self.event_queue.append(event)
 
     def poll(self) -> CallbackEvent | None:
@@ -69,6 +78,12 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
         context: dict[str, Any] | None = None,
     ) -> None:
         """Emit an ``AWAITING_USER_INPUT`` event and flag the loop to pause."""
+        logger.info(
+            "HUMAN_INPUT_REQUEST agent=%s | prompt=%s | options=%s",
+            self.current_agent or "System",
+            prompt,
+            options,
+        )
         payload: dict[str, Any] = {
             "prompt": prompt,
             "agent": self.current_agent or "System",
@@ -86,11 +101,18 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
 
         Returns ``None`` if the user cancelled.
         """
+        logger.info(
+            "USER_RESPONSE agent=%s | input=%s | has_state=%s",
+            self.current_agent,
+            user_input[:80] + "..." if len(user_input) > 80 else user_input,
+            self.paused_state is not None,
+        )
         self.waiting_for_input = False
         state = self.paused_state
         self.paused_state = None
 
         if user_input.lower() in ("cancel", "quit", "exit"):
+            logger.info("USER_CANCELLED agent=%s", self.current_agent)
             self.emit(CallbackEvent(
                 CallbackEventType.BOOKING_FAILED,
                 {"reason": "User cancelled the operation."},
@@ -104,14 +126,21 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
     # -------------------------------------------------------------------
 
     def on_llm_error(self, error: Exception | KeyboardInterrupt, **kwargs: Any) -> None:
-        logger.error("LLM error: %s", error)
+        logger.error("LLM_ERROR agent=%s | error=%s", self.current_agent, error)
         self.emit(CallbackEvent(CallbackEventType.ERROR, {"message": f"LLM error: {error}"}))
 
     def on_tool_error(self, error: Exception | KeyboardInterrupt, **kwargs: Any) -> None:
-        logger.error("Tool error: %s", error)
+        logger.error("TOOL_ERROR agent=%s | error=%s", self.current_agent, error)
         self.emit(CallbackEvent(CallbackEventType.ERROR, {"message": f"Tool error: {error}"}))
 
     def on_agent_finish(self, finish: AgentFinish, **kwargs: Any) -> None:
+        logger.info(
+            "AGENT_FINISH agent=%s | output=%s",
+            self.current_agent or "Unknown",
+            (finish.return_values.get("output", "")[:120] + "...")
+            if len(finish.return_values.get("output", "")) > 120
+            else finish.return_values.get("output", ""),
+        )
         self.emit(CallbackEvent(
             CallbackEventType.AGENT_COMPLETED,
             {
@@ -126,6 +155,7 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
 
     def reset(self) -> None:
         """Clear all state for a fresh conversation."""
+        logger.info("RESET session=%s", self.session_id)
         self.event_queue.clear()
         self.waiting_for_input = False
         self.paused_state = None

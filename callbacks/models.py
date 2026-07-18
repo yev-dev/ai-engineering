@@ -33,6 +33,38 @@ SUPPORTED_CLIENTS = {
     "azure": "azure",
 }
 
+SUPPORTED_MODELS = {
+    "ollama": [
+        "ollama/gemma4:e4b",
+        "ollama/gemma4:26b",
+        "ollama/ggpt-oss:20b",
+    ],
+    "openai": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "gpt-4o-32k",
+        "gpt-4o-32k-mini",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-16k",
+    ],
+    "anthropic": [
+        "claude-v1",
+        "claude-v1.2",
+        "claude-v1.3",
+        "claude-instant-v1",
+        "claude-instant-v1.1",
+    ],
+    "groq": [
+        "groq-groq2-large-v1.0.0",
+    ],
+    "together": [
+        "together/basil-13b-chat",
+    ],
+    "azure": [
+        # Azure models are configured via the Azure OpenAI service
+    ],
+}
+
 # ---------------------------------------------------------------------------
 # LLMRequest — configuration object
 # ---------------------------------------------------------------------------
@@ -50,7 +82,7 @@ class LLMRequest:
         messages:      Conversation history (list of {"role": …, "content": …}).
         callbacks:     LangChain callback handlers to attach.
     """
-    model: str = "ollama/gemma4:e4b"
+    model: str = 'ollama/gemma4:26b'
     client_type: str = "ollama"
     temperature: float = 0.1
     max_tokens: int = 2048

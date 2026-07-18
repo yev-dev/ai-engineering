@@ -1,20 +1,15 @@
 """
-ReAct agent loop and tool execution for the travel booking system.
+ReAct agent loop for the travel booking system.
 
-Uses **litellm** (via ``ModelRequestFactory``) instead of raw httpx for LLM
-interactions.  All tools are proper LangChain ``StructuredTool`` instances
-(no manual JSON tool‑call parsing).
+Tool delegation and human-in-the-loop events are managed through
+``TravelBookingCallbackHandler``, leveraging ``BaseCallbackHandler`` callbacks.
 
-Key design:
-  - ``ModelRequestFactory`` returns a litellm‑backed chat client.
-  - ``TravelBookingCallbackHandler`` is registered with litellm via the
-    ``LLMRequest.callbacks`` field so errors are captured automatically.
-  - The ReAct loop is unchanged in structure — only the LLM call and
-    tool execution paths were swapped.
-  - Delegation uses a dedicated ``delegate_to_agent`` tool, separate from
-    ``request_human_input``, to prevent the infinite loop that occurred
-    when both delegation and user-input pausing were conflated.
-  - A visited‑agents set prevents re-entering the same agent recursively.
+Key simplifications over the previous version:
+  - Tool execution is handled by the processor's ``_handle_tool_call`` method,
+    which delegates special tools (``delegate_to_agent``, ``request_human_input``)
+    through the callback handler.
+  - The ReAct loop is a single method on the processor.
+  - Comprehensive INFO-level logging across all agent, tool, and LLM operations.
 """
 
 from __future__ import annotations
@@ -30,8 +25,8 @@ from agents import (
     CallbackEvent,
     CallbackEventType,
     get_agent,
-    get_tool,
 )
+from tools import get_tool
 from handler import TravelBookingCallbackHandler
 from models import LLMRequest, ModelRequestFactory
 
@@ -61,6 +56,17 @@ def _call_llm(
     The callback handler is attached so litellm fires
     ``on_llm_error`` / ``on_tool_error`` automatically.
     """
+    agent_name = handler.current_agent or "unknown"
+    logger.info(
+        "LLM_CALL agent=%s | messages=%d | system_len=%d",
+        agent_name,
+        len(messages),
+        len(system_prompt),
+    )
+    for i, m in enumerate(messages):
+        logger.debug("LLM_CALL_MSG[%d] agent=%s | role=%s | content_len=%d",
+                     i, agent_name, m.get("role"), len(m.get("content", "")))
+
     request = LLMRequest(
         model=OLLAMA_MODEL,
         system_prompt=system_prompt,
@@ -69,126 +75,44 @@ def _call_llm(
         max_tokens=2048,
         callbacks=[handler],
     )
-    client = _factory.create(request)
-    return client()
+    response = _factory.create(request)()
+
+    logger.info(
+        "LLM_RESPONSE agent=%s | response_len=%d | preview=%s",
+        agent_name,
+        len(response),
+        response[:200] + "..." if len(response) > 200 else response,
+    )
+    return response
 
 
 # ---------------------------------------------------------------------------
-# Tool call parsing (supports JSON, XML, and ReAct Action: formats)
+# Tool call parsing (supports ReAct Action/Action Input format)
 # ---------------------------------------------------------------------------
 
 def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
     """Parse tool calls from LLM output.
 
-    Supports three formats:
-      - JSON: ``{"name": "...", "arguments": {...}}``
-      - XML:  ``<function_call>name</function_call>`` + JSON body
-      - ReAct: ``Action: name\\nAction Input: {...}``
+    Supports the ReAct format produced by LLM prompts:
+
+        Action: <tool_name>
+        Action Input: <JSON arguments for the tool>
     """
     calls: list[dict[str, Any]] = []
 
-    # JSON: {"name": "...", "arguments": {...}}
-    for m in re.finditer(
-        r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}',
-        text, re.DOTALL,
-    ):
-        try:
-            calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
-        except json.JSONDecodeError:
-            pass
-
-    # XML: <function_call>name</function_call> + JSON body
-    for m in re.finditer(r'<function_call>\s*(\w+)\s*</function_call>', text):
-        rest = text[m.end():]
-        am = re.search(r'\{[^}]+\}', rest)
-        try:
-            calls.append({
-                "name": m.group(1),
-                "arguments": json.loads(am.group(0)) if am else {},
-            })
-        except (json.JSONDecodeError, AttributeError):
-            calls.append({"name": m.group(1), "arguments": {}})
-
-    # ReAct: Action: name \n Action Input: {...}
     for m in re.finditer(
         r'Action:\s*(\w+)\s*\nAction Input:\s*(\{.*?\})',
-        text, re.DOTALL,
+        text,
+        re.DOTALL,
     ):
         try:
             calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
-        except json.JSONDecodeError:
+            logger.debug("PARSED_TOOL name=%s | args=%s", m.group(1), m.group(2))
+        except json.JSONDecodeError as e:
+            logger.warning("TOOL_PARSE_SKIP name=%s | json_error=%s", m.group(1), e)
             calls.append({"name": m.group(1), "arguments": {}})
 
     return calls
-
-
-# ---------------------------------------------------------------------------
-# Tool execution using LangChain StructuredTool
-# ---------------------------------------------------------------------------
-
-def _execute_tool(
-    tool_call: dict[str, Any],
-    agent_name: str,
-    handler: TravelBookingCallbackHandler,
-) -> str:
-    """Execute a LangChain tool by name, returning a JSON result string.
-
-    ``request_human_input`` is special‑cased — it triggers the callback
-    handler instead of running a function.  ``delegate_to_agent`` is also
-    special‑cased to return a delegation result that the ReAct loop
-    interprets to switch to a specialist agent.
-    """
-    tool_name = tool_call["name"]
-
-    # Special case: delegate_to_agent — emit delegation result
-    if tool_name == "delegate_to_agent":
-        args = tool_call.get("arguments", {})
-        agent_target = args.get("agent_name", "")
-        request = args.get("request", "")
-        if not agent_target:
-            return json.dumps({
-                "status": "error",
-                "message": "Missing 'agent_name' in delegate_to_agent arguments.",
-            })
-        if not get_agent(agent_target):
-            return json.dumps({
-                "status": "error",
-                "message": f"Unknown agent: {agent_target}. "
-                           f"Must be one of: CarBookingAgent, AirTicketAgent, HotelReservationAgent.",
-            })
-        return json.dumps({
-            "status": "delegating",
-            "delegate_to": agent_target,
-            "original_request": request,
-        })
-
-    # Special case: request_human_input is handled by the callback system
-    if tool_name == "request_human_input":
-        args = tool_call.get("arguments", {})
-        ctx = args.get("context", {})
-        ctx["agent"] = agent_name
-
-        # Specialist agent needs actual user input: pause the loop
-        handler.request_human_input(
-            prompt=args.get("prompt", "Please provide input:"),
-            options=args.get("options"),
-            context=ctx,
-        )
-        return json.dumps({"status": "awaiting_human_input"})
-
-    # Standard LangChain tool
-    tool = get_tool(tool_name)
-    if not tool:
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-    try:
-        result = tool.invoke(tool_call.get("arguments", {}))
-        return json.dumps(result) if not isinstance(result, str) else result
-    except Exception as e:
-        logger.error("Tool '%s' failed: %s", tool_name, e)
-        # Notify the handler so litellm callbacks fire
-        handler.on_tool_error(e)
-        return json.dumps({"error": f"Tool execution failed: {e}"})
 
 
 # ---------------------------------------------------------------------------
@@ -236,141 +160,15 @@ When you need information from the user, use the `request_human_input` tool."""
 
 
 # ---------------------------------------------------------------------------
-# Single ReAct loop (handles both initial runs and resumes)
-# ---------------------------------------------------------------------------
-
-def _react_loop(
-    agent: Agent,
-    handler: TravelBookingCallbackHandler,
-    messages: list[dict[str, str]],
-    system_prompt: str,
-    start_iteration: int = 0,
-    max_iterations: int = 10,
-    visited_agents: set[str] | None = None,
-) -> list[CallbackEvent]:
-    """Run the ReAct loop from the given state.
-
-    Args:
-        agent: The agent to run.
-        handler: Callback handler for human-in-the-loop events.
-        messages: Conversation history so far.
-        system_prompt: The full ReAct system prompt.
-        start_iteration: Which iteration to start from (0 = fresh, >0 = resume).
-        max_iterations: Maximum total iterations.
-        visited_agents: Set of agent names already visited in this delegation
-            chain. Used to prevent infinite delegation loops.
-
-    Returns:
-        Events emitted during this loop segment. The loop pauses when
-        ``request_human_input`` is called; the caller must resume by calling
-        this function again with updated messages.
-    """
-    if visited_agents is None:
-        visited_agents = set()
-
-    # Cycle detection: if we have already run this agent in this chain,
-    # force-complete to prevent infinite loops.
-    if agent.name in visited_agents:
-        logger.warning(
-            "Cycle detected: agent '%s' was already visited. "
-            "Forcing completion to prevent infinite loop.",
-            agent.name,
-        )
-        return [
-            CallbackEvent(
-                CallbackEventType.AGENT_COMPLETED,
-                {
-                    "agent": agent.name,
-                    "result": {
-                        "final_answer": (
-                            f"I already handled this request under {agent.name}. "
-                            "Please provide a new request or clarify."
-                        ),
-                    },
-                },
-            ),
-        ]
-
-    visited_agents.add(agent.name)
-    handler.current_agent = agent.name
-    events: list[CallbackEvent] = []
-
-    for iteration in range(start_iteration, max_iterations):
-        response = _call_llm(system_prompt, messages, handler)
-        messages.append({"role": "assistant", "content": response})
-
-        # Check for final answer
-        if "Final Answer:" in response:
-            events.append(CallbackEvent(
-                CallbackEventType.AGENT_COMPLETED,
-                {"agent": agent.name, "result": {"final_answer": response}},
-            ))
-            return events
-
-        # Parse and execute tool calls
-        tool_calls = _parse_tool_calls(response)
-        if not tool_calls:
-            if iteration < max_iterations - 1:
-                messages.append({
-                    "role": "user",
-                    "content": "Please use one of the available tools to proceed. "
-                               "Use the format:\nAction: <tool_name>\nAction Input: <JSON>",
-                })
-                continue
-            logger.warning("Agent '%s' hit max iterations without completing.", agent.name)
-            return events
-
-        for tc in tool_calls:
-            result = _execute_tool(tc, agent.name, handler)
-            messages.append({"role": "user", "content": f"Tool '{tc['name']}' result: {result}"})
-
-            # Handle delegation: immediately start the specialist agent
-            try:
-                result_data = json.loads(result)
-                if result_data.get("status") == "delegating":
-                    delegate_to = result_data.get("delegate_to")
-                    original_request = result_data.get("original_request", "")
-                    delegate = get_agent(delegate_to) if delegate_to else None
-                    if delegate:
-                        logger.info("Delegating to '%s' with request: %s",
-                                    delegate_to, original_request)
-                        delegate_prompt = _build_react_prompt(delegate)
-                        delegate_messages = [{"role": "user", "content": original_request}]
-                        # Pass visited_agents through so cycles are detected
-                        return _react_loop(
-                            delegate, handler, delegate_messages,
-                            delegate_prompt, start_iteration=0,
-                            max_iterations=max_iterations,
-                            visited_agents=visited_agents,
-                        )
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                pass
-
-            # Pause if waiting for human input
-            try:
-                if json.loads(result).get("status") == "awaiting_human_input":
-                    handler.paused_state = {
-                        "agent": agent.name,
-                        "messages": messages,
-                        "system_prompt": system_prompt,
-                        "iteration": iteration + 1,
-                        "context": tc.get("arguments", {}).get("context", {}),
-                    }
-                    return events
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                pass
-
-    return events
-
-
-# ---------------------------------------------------------------------------
-# Processor (thin facade)
+# Processor
 # ---------------------------------------------------------------------------
 
 class TravelBookingProcessor:
     """Manages agent lifecycle and user interaction.
 
     Uses ``ModelRequestFactory`` internally for all LLM calls.
+    Tool delegation and human-in-the-loop events are routed through
+    ``TravelBookingCallbackHandler``.
     """
 
     def __init__(self) -> None:
@@ -383,32 +181,44 @@ class TravelBookingProcessor:
 
     def process_user_request(self, user_input: str) -> list[CallbackEvent]:
         """Run the orchestrator agent with a new user request."""
+        logger.info("PROCESS_REQUEST input=%s", user_input)
         orchestrator = get_agent("Orchestrator")
         if not orchestrator:
-            return [CallbackEvent(CallbackEventType.ERROR, {"message": "Orchestrator not found"})]
+            logger.error("PROCESS_REQUEST_FAILED agent=Orchestrator not found")
+            return [
+                CallbackEvent(
+                    CallbackEventType.ERROR,
+                    {"message": "Orchestrator not found"},
+                )
+            ]
 
-        system_prompt = _build_react_prompt(orchestrator)
-        messages = [{"role": "user", "content": user_input}]
-
-        events = _react_loop(orchestrator, self.handler, messages, system_prompt)
+        events = self._run_agent(
+            orchestrator,
+            [{"role": "user", "content": user_input}],
+        )
         self.pending_events.extend(events)
         return events
 
     def process_user_response(self, user_input: str) -> list[CallbackEvent]:
         """Resume the paused agent with the user's response."""
+        logger.info("PROCESS_RESPONSE input=%s", user_input)
         state = self.handler.handle_user_response(user_input)
         if state is None:
+            logger.info("PROCESS_RESPONSE_CANCELLED")
             return list(self.handler.event_queue)
 
-        agent = get_agent(state.get("agent", "Orchestrator"))
-        if not agent:
-            agent = get_agent("Orchestrator")
+        agent = get_agent(state.get("agent", "Orchestrator")) or get_agent(
+            "Orchestrator"
+        )
+        logger.info(
+            "PROCESS_RESPONSE_RESUME agent=%s | iteration=%s",
+            agent.name,
+            state.get("iteration"),
+        )
 
-        events = _react_loop(
+        events = self._run_agent(
             agent,
-            self.handler,
             state.get("messages", []),
-            state.get("system_prompt", _build_react_prompt(agent)),
             start_iteration=state.get("iteration", 0),
         )
         self.pending_events.extend(events)
@@ -422,5 +232,300 @@ class TravelBookingProcessor:
 
     def reset(self) -> None:
         """Reset handler and pending events for a fresh conversation."""
+        logger.info("PROCESSOR_RESET")
         self.handler.reset()
         self.pending_events.clear()
+
+    # ------------------------------------------------------------------
+    # Internal: ReAct loop
+    # ------------------------------------------------------------------
+
+    def _run_agent(
+        self,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        start_iteration: int = 0,
+        max_iterations: int = 10,
+        visited_agents: set[str] | None = None,
+    ) -> list[CallbackEvent]:
+        """Run the ReAct loop for *agent*.
+
+        Args:
+            agent: The agent to run.
+            messages: Conversation history so far.
+            start_iteration: Which iteration to start from (0 = fresh).
+            max_iterations: Maximum total iterations.
+            visited_agents: Set of agent names already visited in this
+                delegation chain. Prevents infinite delegation loops.
+
+        Returns:
+            Events emitted during this loop segment. The loop pauses when
+            ``request_human_input`` is called; the caller must resume by
+            calling this method again with updated messages.
+        """
+        if visited_agents is None:
+            visited_agents = set()
+
+        # Cycle detection
+        if agent.name in visited_agents:
+            logger.warning(
+                "CYCLE_DETECTED agent=%s | visited=%s",
+                agent.name, visited_agents,
+            )
+            return [
+                CallbackEvent(
+                    CallbackEventType.AGENT_COMPLETED,
+                    {
+                        "agent": agent.name,
+                        "result": {
+                            "final_answer": (
+                                f"I already handled this request under "
+                                f"{agent.name}. Please provide a new request."
+                            )
+                        },
+                    },
+                )
+            ]
+
+        visited_agents.add(agent.name)
+        self.handler.current_agent = agent.name
+        system_prompt = _build_react_prompt(agent)
+        events: list[CallbackEvent] = []
+
+        logger.info(
+            "REACT_START agent=%s | iterations=[%d..%d] | visited=%s",
+            agent.name,
+            start_iteration,
+            max_iterations - 1,
+            visited_agents,
+        )
+
+        for iteration in range(start_iteration, max_iterations):
+            logger.debug(
+                "REACT_ITER agent=%s | iteration=%d/%d",
+                agent.name,
+                iteration,
+                max_iterations - 1,
+            )
+            response = _call_llm(system_prompt, messages, self.handler)
+            messages.append({"role": "assistant", "content": response})
+
+            # Check for final answer
+            if "Final Answer:" in response:
+                logger.info(
+                    "REACT_FINAL agent=%s | iteration=%d",
+                    agent.name,
+                    iteration,
+                )
+                final_text = response.split("Final Answer:", 1)[-1].strip()
+                events.append(
+                    CallbackEvent(
+                        CallbackEventType.AGENT_COMPLETED,
+                        {
+                            "agent": agent.name,
+                            "result": {"final_answer": final_text},
+                        },
+                    )
+                )
+                return events
+
+            # Parse and execute tool calls
+            tool_calls = _parse_tool_calls(response)
+            if not tool_calls:
+                logger.warning(
+                    "REACT_NO_TOOL agent=%s | iteration=%d | response_preview=%s",
+                    agent.name,
+                    iteration,
+                    response[:300] + "..." if len(response) > 300 else response,
+                )
+                if iteration < max_iterations - 1:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Please use one of the available tools to "
+                                "proceed. Use the format:\n"
+                                "Action: <tool_name>\n"
+                                "Action Input: <JSON>"
+                            ),
+                        }
+                    )
+                    continue
+                logger.warning(
+                    "REACT_MAX_ITER agent=%s | iteration=%d",
+                    agent.name,
+                    iteration,
+                )
+                return events
+
+            logger.info(
+                "REACT_TOOLS agent=%s | iteration=%d | tool_calls=%s",
+                agent.name,
+                iteration,
+                [tc["name"] for tc in tool_calls],
+            )
+
+            for tc in tool_calls:
+                result = self._handle_tool_call(
+                    tc, agent.name, messages, system_prompt,
+                    iteration, visited_agents,
+                )
+                # If the handler returned events (delegation or pause),
+                # return them immediately.
+                if isinstance(result, list):
+                    logger.info(
+                        "REACT_PAUSE agent=%s | iteration=%d | reason=%s",
+                        agent.name,
+                        iteration,
+                        tc["name"],
+                    )
+                    return result
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool '{tc['name']}' result: {result}",
+                    }
+                )
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Internal: Tool execution
+    # ------------------------------------------------------------------
+
+    def _handle_tool_call(
+        self,
+        tc: dict[str, Any],
+        agent_name: str,
+        messages: list[dict[str, str]],
+        system_prompt: str,
+        iteration: int,
+        visited_agents: set[str],
+    ) -> str | list[CallbackEvent]:
+        """Execute a single tool call.
+
+        Returns:
+            - A result string for standard tools.
+            - A list of ``CallbackEvent`` for delegation or pause, which
+              signals the caller to return immediately.
+        """
+        tool_name = tc["name"]
+        args = tc.get("arguments", {})
+        logger.info(
+            "TOOL_CALL agent=%s | tool=%s | args=%s",
+            agent_name,
+            tool_name,
+            args,
+        )
+
+        # --- Delegation ---------------------------------------------------
+        if tool_name == "delegate_to_agent":
+            agent_target = args.get("agent_name", "")
+            request = args.get("request", "")
+
+            if not agent_target:
+                logger.warning("TOOL_DELEGATE_MISSING_AGENT agent=%s", agent_name)
+                return json.dumps({
+                    "status": "error",
+                    "message": "Missing 'agent_name' in delegate_to_agent arguments.",
+                })
+
+            delegate = get_agent(agent_target)
+            if not delegate:
+                logger.warning(
+                    "TOOL_DELEGATE_UNKNOWN agent=%s | target=%s",
+                    agent_name,
+                    agent_target,
+                )
+                return json.dumps({
+                    "status": "error",
+                    "message": (
+                        f"Unknown agent: {agent_target}. "
+                        f"Must be one of: CarBookingAgent, AirTicketAgent, "
+                        f"HotelReservationAgent."
+                    ),
+                })
+
+            logger.info(
+                "TOOL_DELEGATE agent=%s | target=%s | request=%s",
+                agent_name,
+                agent_target,
+                request,
+            )
+
+            # Emit completion for the delegating agent
+            self.handler.emit(
+                CallbackEvent(
+                    CallbackEventType.AGENT_COMPLETED,
+                    {
+                        "agent": agent_name,
+                        "result": {
+                            "final_answer": (
+                                f"Delegating to {agent_target}..."
+                            )
+                        },
+                    },
+                )
+            )
+
+            return self._run_agent(
+                delegate,
+                [{"role": "user", "content": request}],
+                visited_agents=visited_agents,
+            )
+
+        # --- Human input --------------------------------------------------
+        if tool_name == "request_human_input":
+            logger.info(
+                "TOOL_HUMAN_INPUT agent=%s | prompt=%s | options=%s",
+                agent_name,
+                args.get("prompt"),
+                args.get("options"),
+            )
+            self.handler.request_human_input(
+                prompt=args.get("prompt", "Please provide input:"),
+                options=args.get("options"),
+                context={**args.get("context", {}), "agent": agent_name},
+            )
+            self.handler.paused_state = {
+                "agent": agent_name,
+                "messages": messages.copy(),
+                "system_prompt": system_prompt,
+                "iteration": iteration + 1,
+            }
+            logger.info(
+                "TOOL_HUMAN_INPUT_PAUSED agent=%s | iteration=%d",
+                agent_name,
+                iteration,
+            )
+            return [
+                CallbackEvent(
+                    CallbackEventType.AWAITING_USER_INPUT,
+                    {"agent": agent_name},
+                )
+            ]
+
+        # --- Standard LangChain tool --------------------------------------
+        tool = get_tool(tool_name)
+        if not tool:
+            logger.warning("TOOL_UNKNOWN agent=%s | tool=%s", agent_name, tool_name)
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        try:
+            result = tool.invoke(args)
+            logger.info(
+                "TOOL_OK agent=%s | tool=%s | result_preview=%s",
+                agent_name,
+                tool_name,
+                str(result)[:200] + "..." if len(str(result)) > 200 else str(result),
+            )
+            return json.dumps(result) if not isinstance(result, str) else result
+        except Exception as e:
+            logger.error(
+                "TOOL_ERROR agent=%s | tool=%s | error=%s",
+                agent_name,
+                tool_name,
+                e,
+            )
+            self.handler.on_tool_error(e)
+            return json.dumps({"error": f"Tool execution failed: {e}"})
