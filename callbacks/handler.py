@@ -1,13 +1,14 @@
 """
-LangChain callback handler for the travel booking system.
+Callback handler for the travel booking system.
 
-Minimal handler that:
-  - Maintains an event queue for agent → UI communication
-  - Manages human-in-the-loop state (pause/resume)
-  - Overrides only meaningful LangChain callbacks
+Extends ``langchain_core.callbacks.base.BaseCallbackHandler`` so it can be
+registered with **litellm** via the ``callbacks`` parameter.  litellm
+natively supports LangChain callback handlers.
 
 The handler is the bridge between the ReAct agent loop (processor.py)
-and the user interface (cli.py).
+and the user interface (cli.py) — it:
+  - Maintains an event queue for agent → UI communication
+  - Manages human-in-the-loop state (pause/resume)
 """
 
 from __future__ import annotations
@@ -25,9 +26,10 @@ logger = logging.getLogger(__name__)
 
 
 class TravelBookingCallbackHandler(BaseCallbackHandler):
-    """LangChain callback handler for human-in-the-loop events.
+    """LangChain-compatible callback handler for human-in-the-loop events.
 
-    Manages an event queue and pause/resume state for the agent loop.
+    litellm accepts LangChain callback handlers natively — pass an instance
+    via ``LLMRequest(callbacks=[handler])`` to receive LLM and tool events.
     """
 
     def __init__(self) -> None:
@@ -43,9 +45,11 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
     # -------------------------------------------------------------------
 
     def emit(self, event: CallbackEvent) -> None:
+        """Push an event onto the queue."""
         self.event_queue.append(event)
 
     def poll(self) -> CallbackEvent | None:
+        """Pop the oldest event, or return ``None`` if the queue is empty."""
         return self.event_queue.popleft() if self.event_queue else None
 
     def has_events(self) -> bool:
@@ -64,7 +68,7 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
         options: list[str] | None = None,
         context: dict[str, Any] | None = None,
     ) -> None:
-        """Emit an AWAITING_USER_INPUT event and pause the agent loop."""
+        """Emit an ``AWAITING_USER_INPUT`` event and flag the loop to pause."""
         payload: dict[str, Any] = {
             "prompt": prompt,
             "agent": self.current_agent or "System",
@@ -80,7 +84,7 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
     def handle_user_response(self, user_input: str) -> dict[str, Any] | None:
         """Process user response and return saved state for agent resume.
 
-        Returns None if the user cancelled.
+        Returns ``None`` if the user cancelled.
         """
         self.waiting_for_input = False
         state = self.paused_state
@@ -96,7 +100,7 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
         return state
 
     # -------------------------------------------------------------------
-    # LangChain callback overrides (only meaningful ones)
+    # LangChain / litellm callback overrides
     # -------------------------------------------------------------------
 
     def on_llm_error(self, error: Exception | KeyboardInterrupt, **kwargs: Any) -> None:
@@ -121,6 +125,7 @@ class TravelBookingCallbackHandler(BaseCallbackHandler):
     # -------------------------------------------------------------------
 
     def reset(self) -> None:
+        """Clear all state for a fresh conversation."""
         self.event_queue.clear()
         self.waiting_for_input = False
         self.paused_state = None

@@ -1,13 +1,16 @@
 """
 ReAct agent loop and tool execution for the travel booking system.
 
-Uses Ollama API directly (via httpx) to drive ReAct agents. The processor
-manages agent lifecycle, tool execution, and human-in-the-loop pauses.
+Uses **litellm** (via ``ModelRequestFactory``) instead of raw httpx for LLM
+interactions.  All tools are proper LangChain ``StructuredTool`` instances
+(no manual JSON tool‑call parsing).
 
 Key design:
-  - Single _react_loop() function handles both initial runs and resumes
-  - Tool execution is a simple dispatch table
-  - The processor class is a thin facade over the loop + handler
+  - ``ModelRequestFactory`` returns a litellm‑backed chat client.
+  - ``TravelBookingCallbackHandler`` is registered with litellm via the
+    ``LLMRequest.callbacks`` field so errors are captured automatically.
+  - The ReAct loop is unchanged in structure — only the LLM call and
+    tool execution paths were swapped.
 """
 
 from __future__ import annotations
@@ -18,8 +21,6 @@ import os
 import re
 from typing import Any
 
-import httpx
-
 from agents import (
     Agent,
     CallbackEvent,
@@ -28,6 +29,7 @@ from agents import (
     get_tool,
 )
 from handler import TravelBookingCallbackHandler
+from models import LLMRequest, ModelRequestFactory
 
 logger = logging.getLogger(__name__)
 
@@ -35,33 +37,36 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-OLLAMA_BASE = (os.getenv("OLLAMA_ENDPOINT") or "http://localhost:11434").rstrip("/v1")
-OLLAMA_MODEL = (os.getenv("OLLAMA_MODEL") or "gemma4:e4b").strip()
-CHAT_URL = f"{OLLAMA_BASE}/api/chat"
+OLLAMA_MODEL = (os.getenv("LLM_MODEL") or "ollama/gemma4:e4b").strip()
 
 # ---------------------------------------------------------------------------
-# LLM call — direct Ollama API (no litellm dependency)
+# LLM call via ModelRequestFactory
 # ---------------------------------------------------------------------------
+
+_factory = ModelRequestFactory()
+_factory.set_defaults(model=OLLAMA_MODEL)
+
 
 def _call_llm(
     system_prompt: str,
     messages: list[dict[str, str]],
+    handler: TravelBookingCallbackHandler,
 ) -> str:
-    """Call Ollama's chat API directly via httpx."""
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [{"role": "system", "content": system_prompt}] + messages,
-        "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 2048},
-    }
-    try:
-        resp = httpx.post(CHAT_URL, json=payload, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
-    except Exception as e:
-        logger.error("LLM call failed: %s", e)
-        return f"Error: LLM call failed - {e}"
+    """Call the LLM via litellm through ``ModelRequestFactory``.
+
+    The callback handler is attached so litellm fires
+    ``on_llm_error`` / ``on_tool_error`` automatically.
+    """
+    request = LLMRequest(
+        model=OLLAMA_MODEL,
+        system_prompt=system_prompt,
+        messages=messages.copy(),
+        temperature=0.1,
+        max_tokens=2048,
+        callbacks=[handler],
+    )
+    client = _factory.create(request)
+    return client()
 
 
 # ---------------------------------------------------------------------------
@@ -69,26 +74,42 @@ def _call_llm(
 # ---------------------------------------------------------------------------
 
 def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
-    calls = []
+    """Parse tool calls from LLM output.
+
+    Supports three formats:
+      - JSON: ``{"name": "...", "arguments": {...}}``
+      - XML:  ``<function_call>name</function_call>`` + JSON body
+      - ReAct: ``Action: name\\nAction Input: {...}``
+    """
+    calls: list[dict[str, Any]] = []
 
     # JSON: {"name": "...", "arguments": {...}}
-    for m in re.finditer(r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
+    for m in re.finditer(
+        r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}',
+        text, re.DOTALL,
+    ):
         try:
             calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
         except json.JSONDecodeError:
             pass
 
-    # XML: <function_call>name</function_call> + JSON
+    # XML: <function_call>name</function_call> + JSON body
     for m in re.finditer(r'<function_call>\s*(\w+)\s*</function_call>', text):
         rest = text[m.end():]
         am = re.search(r'\{[^}]+\}', rest)
         try:
-            calls.append({"name": m.group(1), "arguments": json.loads(am.group(0)) if am else {}})
+            calls.append({
+                "name": m.group(1),
+                "arguments": json.loads(am.group(0)) if am else {},
+            })
         except (json.JSONDecodeError, AttributeError):
             calls.append({"name": m.group(1), "arguments": {}})
 
     # ReAct: Action: name \n Action Input: {...}
-    for m in re.finditer(r'Action:\s*(\w+)\s*\nAction Input:\s*(\{.*?\})', text, re.DOTALL):
+    for m in re.finditer(
+        r'Action:\s*(\w+)\s*\nAction Input:\s*(\{.*?\})',
+        text, re.DOTALL,
+    ):
         try:
             calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
         except json.JSONDecodeError:
@@ -98,7 +119,7 @@ def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Tool execution
+# Tool execution using LangChain StructuredTool
 # ---------------------------------------------------------------------------
 
 def _execute_tool(
@@ -106,24 +127,21 @@ def _execute_tool(
     agent_name: str,
     handler: TravelBookingCallbackHandler,
 ) -> str:
-    """Execute a tool. Returns JSON result string.
+    """Execute a LangChain tool by name, returning a JSON result string.
 
-    Special-cases request_human_input to trigger the callback handler
-    instead of running a function.
+    ``request_human_input`` is special‑cased — it triggers the callback
+    handler instead of running a function.
     """
-    tool = get_tool(tool_call["name"])
-    if not tool:
-        return json.dumps({"error": f"Unknown tool: {tool_call['name']}"})
+    tool_name = tool_call["name"]
 
-    args = tool_call.get("arguments", {})
-
-    if tool.name == "request_human_input":
+    # Special case: request_human_input is handled by the callback system
+    if tool_name == "request_human_input":
+        args = tool_call.get("arguments", {})
         ctx = args.get("context", {})
         ctx["agent"] = agent_name
         delegate_to = ctx.get("delegate_to")
 
         if delegate_to:
-            # Delegation: immediately start the specialist agent.
             return json.dumps({
                 "status": "delegating",
                 "delegate_to": delegate_to,
@@ -131,8 +149,7 @@ def _execute_tool(
                 "agent": agent_name,
             })
 
-        # Orchestrator called request_human_input without delegate_to.
-        # Instead of pausing for user input, tell it to delegate properly.
+        # Orchestrator called request_human_input without delegate_to
         if agent_name == "Orchestrator":
             return json.dumps({
                 "status": "must_delegate",
@@ -141,7 +158,7 @@ def _execute_tool(
                            "CarBookingAgent, AirTicketAgent, HotelReservationAgent.",
             })
 
-        # Specialist agent needs actual user input: pause the loop.
+        # Specialist agent needs actual user input: pause the loop
         handler.request_human_input(
             prompt=args.get("prompt", "Please provide input:"),
             options=args.get("options"),
@@ -149,14 +166,19 @@ def _execute_tool(
         )
         return json.dumps({"status": "awaiting_human_input"})
 
-    if tool.fn:
-        try:
-            return tool.fn(**args)
-        except Exception as e:
-            logger.error("Tool '%s' failed: %s", tool.name, e)
-            return json.dumps({"error": f"Tool execution failed: {e}"})
+    # Standard LangChain tool
+    tool = get_tool(tool_name)
+    if not tool:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
-    return json.dumps({"error": f"Tool '{tool.name}' has no implementation"})
+    try:
+        result = tool.invoke(tool_call.get("arguments", {}))
+        return json.dumps(result) if not isinstance(result, str) else result
+    except Exception as e:
+        logger.error("Tool '%s' failed: %s", tool_name, e)
+        # Notify the handler so litellm callbacks fire
+        handler.on_tool_error(e)
+        return json.dumps({"error": f"Tool execution failed: {e}"})
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +186,20 @@ def _execute_tool(
 # ---------------------------------------------------------------------------
 
 def _build_react_prompt(agent: Agent) -> str:
-    tools_text = "\n".join(
-        f"  - {t.name}: {t.description}"
-        for t_name in agent.tools
-        if (t := get_tool(t_name))
-    ) or "No tools available."
+    """Build the ReAct system prompt for *agent* with its tools listed."""
+    tools_text_lines: list[str] = []
+    for t_name in agent.tools:
+        if t_name == "request_human_input":
+            tools_text_lines.append(
+                "  - request_human_input: Request input from the human user. "
+                "Use this when you need the user to make a decision or provide information."
+            )
+            continue
+        tool = get_tool(t_name)
+        if tool:
+            tools_text_lines.append(f"  - {tool.name}: {tool.description}")
+
+    tools_text = "\n".join(tools_text_lines) or "No tools available."
 
     return agent.system_prompt + f"""
 
@@ -218,14 +249,14 @@ def _react_loop(
 
     Returns:
         Events emitted during this loop segment. The loop pauses when
-        request_human_input is called — the caller must resume by calling
+        ``request_human_input`` is called; the caller must resume by calling
         this function again with updated messages.
     """
     handler.current_agent = agent.name
     events: list[CallbackEvent] = []
 
     for iteration in range(start_iteration, max_iterations):
-        response = _call_llm(system_prompt, messages)
+        response = _call_llm(system_prompt, messages, handler)
         messages.append({"role": "assistant", "content": response})
 
         # Check for final answer
@@ -243,7 +274,7 @@ def _react_loop(
                 messages.append({
                     "role": "user",
                     "content": "Please use one of the available tools to proceed. "
-                               "Use the format:\nAction: <tool_name>\nAction Input: <JSON>"
+                               "Use the format:\nAction: <tool_name>\nAction Input: <JSON>",
                 })
                 continue
             logger.warning("Agent '%s' hit max iterations without completing.", agent.name)
@@ -261,10 +292,10 @@ def _react_loop(
                     original_request = result_data.get("original_request", "")
                     delegate = get_agent(delegate_to) if delegate_to else None
                     if delegate:
-                        logger.info("Delegating to '%s' with request: %s", delegate_to, original_request)
+                        logger.info("Delegating to '%s' with request: %s",
+                                    delegate_to, original_request)
                         delegate_prompt = _build_react_prompt(delegate)
                         delegate_messages = [{"role": "user", "content": original_request}]
-                        # Run the specialist agent in the same loop
                         return _react_loop(
                             delegate, handler, delegate_messages,
                             delegate_prompt, start_iteration=0, max_iterations=max_iterations,
@@ -294,11 +325,18 @@ def _react_loop(
 # ---------------------------------------------------------------------------
 
 class TravelBookingProcessor:
-    """Manages agent lifecycle and user interaction."""
+    """Manages agent lifecycle and user interaction.
+
+    Uses ``ModelRequestFactory`` internally for all LLM calls.
+    """
 
     def __init__(self) -> None:
         self.handler = TravelBookingCallbackHandler()
         self.pending_events: list[CallbackEvent] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def process_user_request(self, user_input: str) -> list[CallbackEvent]:
         """Run the orchestrator agent with a new user request."""
@@ -324,12 +362,14 @@ class TravelBookingProcessor:
             agent = get_agent("Orchestrator")
 
         # Check for delegation from orchestrator context
-        if state.get("context", {}).get("delegate_to"):
-            delegate = get_agent(state["context"]["delegate_to"])
+        ctx = state.get("context", {})
+        if ctx.get("delegate_to"):
+            delegate = get_agent(ctx["delegate_to"])
             if delegate:
                 agent = delegate
-                # Start fresh messages for the delegated agent
-                state["messages"] = [{"role": "user", "content": state["context"].get("original_request", user_input)}]
+                state["messages"] = [
+                    {"role": "user", "content": ctx.get("original_request", user_input)},
+                ]
                 state["system_prompt"] = _build_react_prompt(agent)
                 state["iteration"] = 0
 
@@ -344,10 +384,12 @@ class TravelBookingProcessor:
         return events
 
     def get_pending_events(self) -> list[CallbackEvent]:
+        """Return and clear any pending events."""
         events = list(self.pending_events)
         self.pending_events.clear()
         return events
 
     def reset(self) -> None:
+        """Reset handler and pending events for a fresh conversation."""
         self.handler.reset()
         self.pending_events.clear()
