@@ -1,289 +1,191 @@
-# Travel Booking Agent System — LangChain Callbacks + ReAct Agents
+# Travel Booking Agent System — Callbacks + ReAct
 
-An LLM-driven travel booking system built with **ReAct agents**, **LangChain-style callbacks**, and **human-in-the-loop** interaction. All agent workflows are driven by a local LLM (Ollama + Gemma 4:e4b) via litellm — no hardcoded workflows.
+An LLM-driven travel booking system built with **ReAct agents** and **human-in-the-loop** callbacks. All workflows are driven by a local LLM (Ollama + Gemma 4:e4b) via litellm — no hardcoded state machines.
 
-## Architecture Overview
+## Architecture
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                        cli.py                            │
-│  Interactive CLI — accepts user text, displays prompts   │
-└────────────────────────┬─────────────────────────────────┘
-                         │ user input / response
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│                     processor.py                          │
-│  TravelBookingProcessor                                  │
-│  ┌─────────────────────────────────────────────────────┐  │
-│  │  run_agent() / resume_agent()                       │  │
-│  │  - ReAct loop (Thought → Action → Observation)      │  │
-│  │  - Tool parsing & execution                         │  │
-│  │  - Agent lifecycle management                       │  │
-│  └─────────────────────────────────────────────────────┘  │
-└────────────────────────┬─────────────────────────────────┘
-                         │ events
-                         ▼
-┌──────────────────────────────────────────────────────────┐
-│                      handler.py                           │
-│  TravelBookingCallbackHandler                            │
-│  - LangChain BaseCallbackHandler subclass                │
-│  - Event queue management                               │
-│  - Human-in-the-loop state machine                      │
-│  - request_human_input() → AWAITING_USER_INPUT event     │
-│  - handle_user_response() → resume agent                 │
-└──────────────────────────────────────────────────────────┘
-```
-
-## Components
-
-### 1. `agents.py` — Agent & Tool Definitions
-
-Defines four **ReAct agents** and their **tools**:
-
-| Agent | Role | Tools |
-|-------|------|-------|
-| **Orchestrator** | Routes user requests to the correct specialist agent | `request_human_input` |
-| **CarBookingAgent** | Handles car rental search & booking | `search_cars`, `book_car`, `select_car_type`, `request_human_input` |
-| **AirTicketAgent** | Handles flight search & booking | `search_flights`, `book_air_ticket`, `request_human_input` |
-| **HotelReservationAgent** | Handles hotel search & booking | `search_hotels`, `book_hotel`, `request_human_input` |
-
-Key design elements:
-
-- **`Agent` dataclass** — each agent has a `system_prompt`, `name`, `description`, and list of `tools` it can use
-- **`Tool` dataclass** — each tool has a `name`, `description`, JSON `parameters` schema, and an optional `fn` implementation
-- **`TOOL_REGISTRY` / `AGENT_REGISTRY`** — dict-based registries for dynamic lookup
-- **`CallbackEvent` / `CallbackEventType`** — typed events that flow through the callback system (e.g., `AWAITING_USER_INPUT`, `SELECT_CAR`, `BOOKING_CONFIRMED`)
-
-**Prompt templates** (`CAR_TYPE_SELECTION_PROMPT`, `FLIGHT_SELECTION_PROMPT`, etc.) format options for the user when a human-in-the-loop decision is needed.
-
-### 2. `handler.py` — LangChain Callback Handler
-
-A custom `BaseCallbackHandler` subclass called `TravelBookingCallbackHandler`. It:
-
-- **Maintains an event queue** (`deque[CallbackEvent]`) — events emitted by agents are queued here
-- **Manages human-in-the-loop state** — tracks whether the system is waiting for user input (`waiting_for_input` flag) and stores the context needed to resume the agent (`pending_context`)
-- **Provides `request_human_input()`** — emits an `AWAITING_USER_INPUT` event with the prompt and selectable options, then pauses the agent loop
-- **Provides `handle_user_response()`** — accepts the user's text, stores it in conversation history, and returns the context so `processor.py` can resume the agent
-- **Overrides LangChain callbacks** — `on_llm_start/end`, `on_agent_action/finish`, `on_tool_start/end`, `on_text`, etc. — to log activity and emit events
-
-The handler is the **bridge** between the agent loop (which is LLM-driven) and the CLI (which is human-driven).
-
-### 3. `processor.py` — Agent Loop & Tool Execution
-
-The core engine that runs the ReAct loop for each agent:
-
-**`run_agent(agent, user_input, callback_handler)`**
-
-1. Builds the ReAct system prompt (agent's system prompt + tool descriptions + ReAct format instructions)
-2. Calls the LLM via litellm (`completion()` with Ollama/Gemma 4:e4b)
-3. Parses tool calls from the LLM response (supports JSON, XML, and ReAct `Action:` formats)
-4. Executes each tool via `_execute_tool()`
-5. Special-cases `request_human_input` — instead of executing a function, it triggers the callback handler's human-in-the-loop mechanism, which pauses the ReAct loop
-6. Repeats until `Final Answer:` is found or max iterations reached
-
-**`resume_agent(agent, user_input, callback_handler)`**
-
-- Restores saved state (`messages`, `iteration`, `system_prompt`) from the callback handler's `pending_context`
-- Appends the user's response to the conversation history
-- Continues the ReAct loop from where it paused
-
-**`_call_llm()`**
-
-- Uses litellm's `completion()` with `model="ollama/gemma4:e4b"`, configurable via `OLLAMA_ENDPOINT` and `OLLAMA_MODEL` environment variables
-- Passes tools in OpenAI-compatible format to enable function-calling when the model supports it
-
-**`_parse_tool_calls()`**
-
-Parses tool calls from LLM text in three formats:
-- `{"name": "tool_name", "arguments": {...}}` — JSON function call
-- `<function_call>tool</function_call>` + JSON args — XML style
-- `Action: tool\nAction Input: {...}` — classic ReAct format
-
-### 4. `cli.py` — Interactive CLI
-
-The user-facing interface. Key methods:
-
-- **`handle_user_input(user_input)`** — routes input to either `process_user_request()` (new requests) or `process_user_response()` (responses to human-in-the-loop prompts), then processes all emitted events
-- **Event handlers** — `_handle_awaiting_input_event()`, `_handle_select_car_event()`, `_handle_agent_completed_event()`, `_handle_booking_confirmed_event()`, etc. — display formatted output to the user
-- **Commands**: `help`, `quit`/`exit`, `reset`, or any natural language request
-
-## Data Flow (End-to-End)
-
-### New user request flow
+The system has four files with clear separation of concerns:
 
 ```
-User: "Book a car in London next week"
-        │
-        ▼
-cli.py ──► processor.py.process_user_request("Book a car...")
-                │
-                ▼
-        run_agent(Orchestrator, "Book a car...")
-                │
-                ▼
-        LLM (Gemma 4:e4b) decides: "This is a car booking → delegate to CarBookingAgent"
-                │
-                ▼
-        request_human_input(prompt="I'll delegate...", context={delegate_to: "CarBookingAgent"})
-                │
-                ▼
-        AWAITING_USER_INPUT event emitted to callback handler's queue
-                │
-                ▼
-cli.py picks up the event, displays prompt to user
-                │
-User: "Yes, I want an SUV"
-                │
-                ▼
-cli.py ──► processor.py.process_user_response("Yes, I want an SUV")
-                │
-                ▼
-        resume_agent(CarBookingAgent, "Yes, I want an SUV")
-                │
-                ▼
-        LLM decides: "Search cars in London"
-                │
-        Action: search_cars
-        Action Input: {"location": "London", "pickup_date": "2026-07-25", "dropoff_date": "2026-07-28"}
-                │
-                ▼
-        Tool returns: {"available_cars": [...3 cars...]}
-                │
-                ▼
-        LLM decides: "Present options to user"
-                │
-        Action: request_human_input(prompt="Select a car:", options=["Toyota Corolla $45/day", ...])
-                │
-                ▼
-        AWAITING_USER_INPUT event → CLI displays options
-                │
-User: "1"  (selects first car)
-                │
-                ▼
-cli.py ──► processor.py.process_user_response("1")
-                │
-                ▼
-        resume_agent(CarBookingAgent, "1")
-                │
-                ▼
-        LLM decides: "User selected Toyota Corolla → book it"
-                │
-        Action: book_car(car_id="car_1", ...)
-                │
-                ▼
-        Tool returns: {"status": "pending_confirmation", ...}
-                │
-                ▼
-        LLM decides: "Ask user to confirm car type"
-                │
-        Action: request_human_input(prompt="Confirm car type:", options=["Toyota Corolla", ...])
-                │
-                ▼
-        AWAITING_USER_INPUT event → CLI displays confirmation
-                │
-User: "1"  (confirms)
-                │
-                ▼
-        resume_agent → LLM → select_car_type(car_id="car_1", car_type="Toyota Corolla")
-                │
-                ▼
-        Final Answer: "Car booked successfully..." → AGENT_COMPLETED event
+┌──────────────────────────────────────────────────┐
+│                   cli.py                         │
+│  Presentation layer                              │
+│  - Prompt templates (CAR_TYPE_SELECTION, etc.)   │
+│  - Formatters (format_car_options, etc.)         │
+│  - Event display dispatch                        │
+│  - User input loop                               │
+│  Depends on: agents.py (types), processor.py     │
+└──────────────────────┬────────────────────────────┘
+                       │ user request / response
+                       ▼
+┌──────────────────────────────────────────────────┐
+│               processor.py                        │
+│  Orchestration layer                              │
+│  - _react_loop() — single ReAct loop             │
+│  - _call_llm() — litellm → Ollama                │
+│  - _parse_tool_calls() — 3 formats (JSON, XML,   │
+│    Action:)                                       │
+│  - _execute_tool() — dispatch table               │
+│  - TravelBookingProcessor — thin facade           │
+│  Depends on: agents.py, handler.py               │
+└──────────────────────┬────────────────────────────┘
+                       │ events / pause
+                       ▼
+┌──────────────────────────────────────────────────┐
+│                handler.py                         │
+│  Callback layer                                   │
+│  - TravelBookingCallbackHandler (extends          │
+│    BaseCallbackHandler)                           │
+│  - Event queue (emit/poll/has_events)             │
+│  - Pause/resume state for HITL                   │
+│  - Overrides: on_agent_finish, on_*_error         │
+│  Depends on: agents.py (types)                   │
+└──────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────┐
+│                agents.py                          │
+│  Data layer                                       │
+│  - Core types: Agent, Tool, CallbackEvent,        │
+│    CallbackEventType                              │
+│  - Tool implementations (stubs)                   │
+│  - TOOL_REGISTRY, AGENT_REGISTRY                  │
+│  - Lookup helpers: get_agent(), get_tool()        │
+│  No dependencies on other modules                 │
+└──────────────────────────────────────────────────┘
 ```
 
-### How human-in-the-loop works step by step
+## File Responsibilities
 
-1. **Agent calls `request_human_input`** via the ReAct `Action: request_human_input` format
-2. **`_execute_tool()`** detects this is the special human-input tool and calls `callback_handler.request_human_input(prompt, options, context)`
-3. **Callback handler** emits an `AWAITING_USER_INPUT` event to its queue and sets `waiting_for_input = True`, storing the agent's current state (`messages`, `iteration`, `system_prompt`) in `pending_context`
-4. **`run_agent()` / `resume_agent()`** returns early — the agent loop pauses
-5. **CLI** picks up the `AWAITING_USER_INPUT` event, displays the prompt and options, and waits for user input
-6. **User types a response** → CLI calls `processor.py.process_user_response(user_input)`
-7. **Processor** calls `callback_handler.handle_user_response(user_input)` which stores the response and returns the saved context
-8. **Processor** calls `resume_agent()` with the saved state + user response, which appends "User response: ..." to the messages and continues the ReAct loop
+### `agents.py` — Data layer (pure configuration)
 
-### How the ReAct loop works
+- **Types**: `Agent`, `Tool`, `CallbackEvent`, `CallbackEventType`
+- **Tool stubs**: 8 functions that return JSON strings (`search_cars`, `book_car`, `select_car_type`, `search_flights`, `book_air_ticket`, `search_hotels`, `book_hotel`, `request_human_input`)
+- **Registries**: `TOOL_REGISTRY` (8 tools with JSON Schemas + implementations), `AGENT_REGISTRY` (4 agents with system prompts + tool lists)
+- **Lookups**: `get_agent()`, `get_tool()`
+- No imports from other project modules
 
-The ReAct (Reasoning + Acting) loop is the core pattern:
+### `handler.py` — Callback layer
+
+- **`TravelBookingCallbackHandler`** extends LangChain's `BaseCallbackHandler`
+- **Event queue**: `emit()`, `poll()`, `has_events()`, `clear_events()`
+- **Human-in-the-loop**: `request_human_input()` pauses the agent and emits an `AWAITING_USER_INPUT` event; `handle_user_response()` returns saved state or None on cancel
+- **Overrides**: `on_agent_finish` (emits `AGENT_COMPLETED`), `on_llm_error`/`on_tool_error` (emit `ERROR`)
+- 60 lines of logic — no dead code, no unused overrides
+
+### `processor.py` — Orchestration layer
+
+- **`_call_llm()`**: calls litellm `completion()` with `model="ollama/gemma4:e4b"`
+- **`_parse_tool_calls()`**: parses LLM output in 3 formats (JSON `{"name", "arguments"}`, XML `<function_call>`, ReAct `Action:` + `Action Input:`)
+- **`_execute_tool()`**: dispatch table — special-cases `request_human_input` to trigger the handler, otherwise calls `tool.fn(**args)`
+- **`_react_loop()`**: **single** function handling both initial runs and resumed pauses — no `run_agent`/`resume_agent` duplication
+- **`TravelBookingProcessor`**: thin facade — `process_user_request()` starts the orchestrator, `process_user_response()` resumes the paused agent
+
+### `cli.py` — Presentation layer
+
+- **Prompt templates**: `CAR_TYPE_SELECTION_PROMPT`, `FLIGHT_SELECTION_PROMPT`, `HOTEL_SELECTION_PROMPT`, `GENERAL_INPUT_PROMPT`, `CONFIRMATION_PROMPT`
+- **Formatters**: `format_car_options()`, `format_flight_options()`, `format_hotel_options()`
+- **`_event_display()`**: pure function mapping event → display string — one place for all UI formatting
+- **`TravelBookingCLI`**: input loop with `help`, `quit`, `reset` commands, delegates to processor
+
+## Data Flow
+
+### New request
 
 ```
-Iteration 1:
-  LLM: Thought: The user wants to book a car. I should search for available cars.
-       Action: search_cars
-       Action Input: {"location": "London", "pickup_date": "2026-07-25", "dropoff_date": "2026-07-28"}
-
-  Processor: Executes search_cars → returns results
-
-Iteration 2:
-  LLM: Thought: I found 3 cars. I need the user to select one.
-       Action: request_human_input
-       Action Input: {"prompt": "Select a car:", "options": [...]}
-
-  Processor: Triggers callback → pauses for user input
-
-  ...user responds...
-
-Iteration 3:
-  LLM: Thought: The user selected option 1. I'll book that car.
-       Action: book_car
-       Action Input: {"car_id": "car_1", ...}
-
-  ...continues until Final Answer...
+User: "Book a car in London"
+  │
+  ▼  cli → processor.process_user_request("Book a car...")
+  │
+  ▼  _react_loop(Orchestrator, messages=[user_input])
+  │     │
+  │     ▼ Iteration 1: LLM decides "This needs CarBookingAgent"
+  │     → Action: request_human_input(prompt="Delegating...", context={delegate_to: "CarBookingAgent"})
+  │     → handler.request_human_input() → emits AWAITING_USER_INPUT
+  │     → pauses (saves state in handler.paused_state)
+  │
+  ▼  cli displays the prompt and waits
+  │
+User: "Yes, book an SUV"
+  │
+  ▼  cli → processor.process_user_response("Yes, book an SUV")
+  │
+  ▼  handler.handle_user_response() → returns saved state
+  ▼  Detects delegate_to → starts fresh CarBookingAgent
+  ▼  _react_loop(CarBookingAgent, messages=[user_request], start_iteration=0)
+  │     │
+  │     ▼ Iteration 1: Action: search_cars(location="London")
+  │     → result: {"available_cars": [...]}
+  │     │
+  │     ▼ Iteration 2: Action: request_human_input(prompt="Select car:", options=[...])
+  │     → pauses
+  │
+  ▼  cli displays options → user selects "1"
+  ▼  resume → _react_loop with updated messages
+  │     ▼ Action: book_car(car_id="car_1")
+  │     ▼ Action: request_human_input(prompt="Confirm car type:")
+  │     ▼ Action: select_car_type(car_id="car_1", car_type="Toyota Corolla")
+  │     ▼ Final Answer: "Car Toyota Corolla booked in London..."
+  │     → emits AGENT_COMPLETED
 ```
 
-## Configuration
+### Resume cycle
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `OLLAMA_ENDPOINT` | `http://localhost:11434` | Ollama API endpoint |
-| `OLLAMA_MODEL` | `gemma4:e4b` | Ollama model name |
-| `LITELLM_LOG` | `WARNING` | litellm log level |
+1. `handler.request_human_input()` emits `AWAITING_USER_INPUT`, sets `waiting_for_input=True`, saves state in `paused_state`
+2. `_react_loop()` returns early — loop pauses
+3. CLI displays the prompt, collects user input
+4. `process_user_response()` calls `handler.handle_user_response()` which returns the saved state
+5. Processor calls `_react_loop()` again with the saved messages + user response appended
+6. LLM continues reasoning with the new input
 
-## Running the System
+## Changes from Original Design
 
-```bash
-# Ensure Ollama is running with the required model
-ollama pull gemma4:e4b
-
-# Run the CLI
-python cli.py
-```
-
-## Design Principles
-
-1. **LLM-driven workflows** — no hardcoded state machines or workflows. The LLM decides which tools to call and when, based on its ReAct reasoning.
-
-2. **Human-in-the-loop via callbacks** — when the agent needs user input, it emits a callback event and pauses. The UI layer (CLI) handles the event, collects user input, and resumes the agent.
-
-3. **Modular agent definitions** — agents, tools, and prompt templates are all defined declaratively in `agents.py`. Adding a new agent (e.g., `TrainBookingAgent`) requires only adding its definition and tools — no changes to the processor or handler.
-
-4. **Event-driven architecture** — the callback handler's event queue decouples the agent loop from the UI. The same processor could drive a web UI or an API server by replacing only the CLI layer.
-
-5. **Flexible tool call parsing** — supports multiple LLM output formats (JSON, XML, ReAct) to work with different models and prompt styles.
+| Aspect | Before | After |
+|--------|--------|-------|
+| **ReAct loop** | `run_agent()` + `resume_agent()` (80% duplicated, 200+ lines) | Single `_react_loop()` (60 lines) |
+| **Presentation** | Prompt templates + formatters in `agents.py` | Moved to `cli.py` — the UI layer |
+| **Event helpers** | Dead `process_callback_event/s` in `handler.py` (70 lines, never called) | Removed |
+| **Handler imports** | 10+ unused imports from `agents` | Just `CallbackEvent`, `CallbackEventType` |
+| **Handler overrides** | 7 overrides, most just logging | 3 meaningful overrides |
+| **State management** | `pending_context` in handler + duplicate tracking | Single `paused_state` dict |
+| **CLI event dispatch** | 8 separate `_handle_*` methods | Single `_event_display()` function |
+| **File sizes** | agents.py 465, handler.py 325, processor.py 593, cli.py 271 | agents.py 290, handler.py 130, processor.py 220, cli.py 250 |
 
 ## Adding a New Agent
 
 ```python
-# In agents.py:
+# In agents.py — add tool implementations
+def _search_trains(origin, destination, date):
+    return json.dumps({"available_trains": [...], ...})
 
-CAR_BOOKING_SYSTEM_PROMPT = """You are a train booking specialist agent.
-    Search for trains, present options, and book when confirmed."""
-
-TRAIN_BOOKING_AGENT = Agent(
-    name="TrainBookingAgent",
-    description="Handles train ticket booking.",
-    system_prompt=TRAIN_BOOKING_SYSTEM_PROMPT,
-    tools=["search_trains", "book_train_ticket", "request_human_input"],
-)
-
-AGENT_REGISTRY["TrainBookingAgent"] = TRAIN_BOOKING_AGENT
-
-# Add new tools to TOOL_REGISTRY
+# Register the tool
 TOOL_REGISTRY["search_trains"] = Tool(
     name="search_trains",
-    description="Search for available trains between cities on a date.",
-    parameters={...},
+    description="Search for available trains...",
+    parameters={"type": "object", "properties": {...}, "required": [...]},
     fn=_search_trains,
+)
+
+# Define the agent
+AGENT_REGISTRY["TrainBookingAgent"] = Agent(
+    name="TrainBookingAgent",
+    description="Handles train ticket booking.",
+    system_prompt="You are a train booking specialist...",
+    tools=["search_trains", "book_train_ticket", "request_human_input"],
 )
 ```
 
-The orchestrator will automatically discover and delegate to the new agent based on the LLM's reasoning about the user's request.
+The orchestrator automatically discovers the new agent via the LLM's reasoning about which agent name to delegate to.
+
+## Running
+
+```bash
+ollama pull gemma4:e4b
+python cli.py
+```
+
+| Environment Variable | Default | Purpose |
+|---------------------|---------|---------|
+| `OLLAMA_ENDPOINT` | `http://localhost:11434` | Ollama API URL |
+| `OLLAMA_MODEL` | `gemma4:e4b` | Model name |
+| `LITELLM_LOG` | `WARNING` | litellm verbosity |

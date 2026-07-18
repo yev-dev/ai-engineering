@@ -5,7 +5,6 @@ CLI for the travel booking agent system using LangChain callbacks.
 Provides an interactive command-line interface where users can:
   - Make travel requests in natural language
   - Respond to agent prompts (human-in-the-loop) with selectable options
-  - Confirm car types, flights, and hotels
   - View booking status
 
 Uses LangChain's callback system for human-in-the-loop interaction
@@ -19,34 +18,128 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from typing import Any
 
-from agents import (
-    CallbackEvent,
-    CallbackEventType,
-    CAR_TYPE_SELECTION_PROMPT,
-    FLIGHT_SELECTION_PROMPT,
-    HOTEL_SELECTION_PROMPT,
-    GENERAL_INPUT_PROMPT,
-    CONFIRMATION_PROMPT,
-    format_car_options,
-    format_flight_options,
-    format_hotel_options,
-)
-from handler import process_callback_event
+from agents import CallbackEvent, CallbackEventType
 from processor import TravelBookingProcessor
 
+logger = logging.getLogger("cli")
+
 # ---------------------------------------------------------------------------
-# Logging setup
+# Prompt templates (presentation layer)
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("cli")
+CAR_TYPE_SELECTION_PROMPT = """Please select a car type from the following options:
+
+{options}
+
+Enter the number of your choice (1-{count}), or type 'cancel' to abort:"""
+
+FLIGHT_SELECTION_PROMPT = """Please select a flight from the following options:
+
+{options}
+
+Enter the number of your choice (1-{count}), or type 'cancel' to abort:"""
+
+HOTEL_SELECTION_PROMPT = """Please select a hotel from the following options:
+
+{options}
+
+Enter the number of your choice (1-{count}), or type 'cancel' to abort:"""
+
+GENERAL_INPUT_PROMPT = """{message}
+
+Please provide the required information:"""
+
+CONFIRMATION_PROMPT = """Please confirm the following:
+
+{details}
+
+Type 'yes' to confirm, 'no' to cancel, or provide alternative details:"""
+
+
+def format_car_options(cars: list[dict[str, Any]]) -> str:
+    lines = []
+    for i, car in enumerate(cars, 1):
+        lines.append(
+            f"  {i}. {car.get('make', 'Unknown')} {car.get('model', 'Unknown')} "
+            f"- ${car.get('price_per_day', '?')}/day"
+        )
+    return "\n".join(lines)
+
+
+def format_flight_options(flights: list[dict[str, Any]]) -> str:
+    lines = []
+    for i, flight in enumerate(flights, 1):
+        lines.append(
+            f"  {i}. {flight.get('airline', 'Unknown')} {flight.get('flight', '')} "
+            f"- ${flight.get('price', '?')} "
+            f"({flight.get('departure', '?')} - {flight.get('arrival', '?')})"
+        )
+    return "\n".join(lines)
+
+
+def format_hotel_options(hotels: list[dict[str, Any]]) -> str:
+    lines = []
+    for i, hotel in enumerate(hotels, 1):
+        lines.append(
+            f"  {i}. {hotel.get('name', 'Unknown')} "
+            f"({'★' * hotel.get('stars', 0)}) "
+            f"- ${hotel.get('price_per_night', '?')}/night"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Event display
+# ---------------------------------------------------------------------------
+
+def _event_display(event: CallbackEvent) -> str | None:
+    """Return a display string for an event, or None if it should be silent."""
+    p = event.payload
+    tag = f"[{p.get('agent', 'System')}]"
+
+    if event.type == CallbackEventType.AWAITING_USER_INPUT:
+        text = f"\n{tag} {p.get('prompt', '')}"
+        options = p.get("options")
+        if options:
+            items = "\n".join(f"  {i}. {o}" for i, o in enumerate(options, 1))
+            text += f"\n\n{items}\n\n  (Enter the number of your choice, or type your response)"
+        return text
+
+    if event.type == CallbackEventType.AGENT_COMPLETED:
+        answer = (p.get("result", {}) or {}).get("final_answer", "")
+        if "Final Answer:" in answer:
+            answer = answer.split("Final Answer:")[-1].strip()
+        return f"\n{tag} {answer}" if answer else f"\n{tag} Task completed."
+
+    if event.type == CallbackEventType.BOOKING_CONFIRMED:
+        return f"\n[System] ✅ Booking confirmed!\n{json.dumps(p.get('details', {}), indent=2)}"
+
+    if event.type == CallbackEventType.BOOKING_FAILED:
+        return f"\n[System] ❌ Booking failed: {p.get('reason', 'Unknown error')}"
+
+    if event.type == CallbackEventType.ERROR:
+        return f"\n[System] ⚠️  Error: {p.get('message', 'Unknown error')}"
+
+    if event.type == CallbackEventType.CAR_TYPE_CONFIRMED:
+        return f"\n[System] Car type '{p.get('car_type', '')}' confirmed for {p.get('car_id', '')}."
+
+    if event.type == CallbackEventType.SELECT_CAR:
+        lines = [f"\n[CarBookingAgent] Car {p.get('car_id', 'unknown')} selected."]
+        cars = p.get("available_cars", [])
+        if cars:
+            lines.append("Available car options:")
+            lines.append(format_car_options(cars))
+        prompt = CAR_TYPE_SELECTION_PROMPT.format(
+            options=format_car_options(cars),
+            count=len(cars),
+        ) if cars else ""
+        if prompt:
+            lines.append(f"\n{prompt}")
+        return "\n".join(lines)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -54,15 +147,14 @@ logger = logging.getLogger("cli")
 # ---------------------------------------------------------------------------
 
 class TravelBookingCLI:
-    """Interactive CLI for the travel booking system using LangChain callbacks."""
+    """Interactive CLI for the travel booking system."""
 
     def __init__(self) -> None:
         self.processor = TravelBookingProcessor()
         self.running = True
         self.waiting_for_input = False
 
-    def print_header(self) -> None:
-        """Print the application header."""
+    def _print_header(self) -> None:
         print("=" * 60)
         print("  Travel Booking Agent System")
         print("  Powered by ReAct Agents + LangChain Callbacks")
@@ -73,8 +165,7 @@ class TravelBookingCLI:
         print("Type 'quit' to exit, 'help' for commands.")
         print()
 
-    def print_help(self) -> None:
-        """Print help information."""
+    def _print_help(self) -> None:
         print()
         print("Commands:")
         print("  help              - Show this help message")
@@ -88,155 +179,58 @@ class TravelBookingCLI:
         print('  "I need a car, flight, and hotel for my trip to Barcelona"')
         print()
 
-    def _format_options_for_display(self, options: list[str] | None) -> str:
-        """Format a list of options for display to the user."""
-        if not options:
-            return ""
-        lines = []
-        for i, option in enumerate(options, 1):
-            lines.append(f"  {i}. {option}")
-        return "\n".join(lines)
-
-    def _handle_awaiting_input_event(self, event: CallbackEvent) -> None:
-        """Handle an AWAITING_USER_INPUT event by displaying the prompt."""
-        payload = event.payload
-        prompt = payload.get("prompt", "Please provide input:")
-        options = payload.get("options", None)
-        agent_name = payload.get("agent", "System")
-
-        print(f"\n[{agent_name}] {prompt}")
-
-        if options:
-            print()
-            print(self._format_options_for_display(options))
-            print()
-            print("  (Enter the number of your choice, or type your response)")
-
-        self.waiting_for_input = True
-
-    def _handle_select_car_event(self, event: CallbackEvent) -> None:
-        """Handle a SELECT_CAR event."""
-        payload = event.payload
-        car_id = payload.get("car_id", "unknown")
-        location = payload.get("location", "")
-        pickup_date = payload.get("pickup_date", "")
-        dropoff_date = payload.get("dropoff_date", "")
-        available_cars = payload.get("available_cars", [])
-
-        print(f"\n[CarBookingAgent] Car {car_id} has been selected.")
-        if available_cars:
-            print("Available car options:")
-            print(format_car_options(available_cars))
-        print(f"Location: {location}, Pickup: {pickup_date}, Dropoff: {dropoff_date}")
-
-        # Use the prompt template
-        if available_cars:
-            prompt = CAR_TYPE_SELECTION_PROMPT.format(
-                options=format_car_options(available_cars),
-                count=len(available_cars),
-            )
-            print(f"\n{prompt}")
-
-        self.waiting_for_input = True
-
-    def _handle_agent_completed_event(self, event: CallbackEvent) -> None:
-        """Handle an AGENT_COMPLETED event."""
-        agent_name = event.payload.get("agent", "Unknown")
-        result = event.payload.get("result", {})
-        final_answer = result.get("final_answer", "")
-
-        if final_answer:
-            # Extract just the final answer part
-            if "Final Answer:" in final_answer:
-                answer = final_answer.split("Final Answer:")[-1].strip()
-                print(f"\n[{agent_name}] {answer}")
-            else:
-                print(f"\n[{agent_name}] {final_answer}")
-        else:
-            print(f"\n[{agent_name}] Task completed.")
-
-    def _handle_booking_confirmed_event(self, event: CallbackEvent) -> None:
-        """Handle a BOOKING_CONFIRMED event."""
-        details = event.payload.get("details", {})
-        print(f"\n[System] ✅ Booking confirmed!")
-        print(json.dumps(details, indent=2))
-
-    def _handle_booking_failed_event(self, event: CallbackEvent) -> None:
-        """Handle a BOOKING_FAILED event."""
-        reason = event.payload.get("reason", "Unknown error")
-        print(f"\n[System] ❌ Booking failed: {reason}")
-
-    def _handle_error_event(self, event: CallbackEvent) -> None:
-        """Handle an ERROR event."""
-        message = event.payload.get("message", "Unknown error")
-        print(f"\n[System] ⚠️  Error: {message}")
-
-    def _handle_events(self, events: list[CallbackEvent]) -> None:
-        """Handle events emitted by the processor."""
+    def _drain_events(self, events: list[CallbackEvent]) -> None:
+        """Display all events from a list + any queued in the handler."""
         for event in events:
-            if event.type == CallbackEventType.AWAITING_USER_INPUT:
-                self._handle_awaiting_input_event(event)
-            elif event.type == CallbackEventType.SELECT_CAR:
-                self._handle_select_car_event(event)
-            elif event.type == CallbackEventType.AGENT_COMPLETED:
-                self._handle_agent_completed_event(event)
-            elif event.type == CallbackEventType.BOOKING_CONFIRMED:
-                self._handle_booking_confirmed_event(event)
-            elif event.type == CallbackEventType.BOOKING_FAILED:
-                self._handle_booking_failed_event(event)
-            elif event.type == CallbackEventType.ERROR:
-                self._handle_error_event(event)
-            elif event.type == CallbackEventType.CAR_TYPE_CONFIRMED:
-                car_id = event.payload.get("car_id", "unknown")
-                car_type = event.payload.get("car_type", "")
-                print(f"\n[System] Car type '{car_type}' confirmed for {car_id}.")
+            text = _event_display(event)
+            if text:
+                print(text)
+
+        # Drain the handler's event queue
+        while self.processor.handler.has_events():
+            event = self.processor.handler.poll()
+            if event:
+                text = _event_display(event)
+                if text:
+                    print(text)
 
     def handle_user_input(self, user_input: str) -> None:
-        """Process user input and handle the response."""
+        """Process user input and display resulting events."""
         if self.waiting_for_input:
-            # This is a response to a human-in-the-loop prompt
             events = self.processor.process_user_response(user_input)
             self.waiting_for_input = False
         else:
-            # This is a new user request
             events = self.processor.process_user_request(user_input)
 
-        # Process any emitted events
-        self._handle_events(events)
+        self._drain_events(events)
 
-        # Also check the callback handler's event queue
-        handler = self.processor.callback_handler
-        while handler.has_events():
-            event = handler.get_next_event()
-            if event:
-                self._handle_events([event])
+        # If the handler is now waiting, update the flag
+        if self.processor.handler.waiting_for_input:
+            self.waiting_for_input = True
 
     def run(self) -> None:
         """Run the CLI main loop."""
-        self.print_header()
+        self._print_header()
 
         while self.running:
             try:
-                if self.waiting_for_input:
-                    prompt = "> "
-                else:
-                    prompt = "\nYou: "
-
+                prompt = "> " if self.waiting_for_input else "\nYou: "
                 user_input = input(prompt).strip()
 
                 if not user_input:
                     continue
 
-                if user_input.lower() in ("quit", "exit"):
+                cmd = user_input.lower()
+                if cmd in ("quit", "exit"):
                     print("\nThank you for using the Travel Booking Agent System. Goodbye!")
                     self.running = False
                     break
 
-                if user_input.lower() == "help":
-                    self.print_help()
+                if cmd == "help":
+                    self._print_help()
                     continue
 
-                if user_input.lower() == "reset":
+                if cmd == "reset":
                     self.processor.reset()
                     self.waiting_for_input = False
                     print("\n[System] Conversation reset.")
@@ -244,11 +238,7 @@ class TravelBookingCLI:
 
                 self.handle_user_input(user_input)
 
-            except KeyboardInterrupt:
-                print("\n\nExiting...")
-                self.running = False
-                break
-            except EOFError:
+            except (KeyboardInterrupt, EOFError):
                 print("\n\nExiting...")
                 self.running = False
                 break
@@ -262,7 +252,11 @@ class TravelBookingCLI:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Main entry point for the CLI."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     cli = TravelBookingCLI()
     cli.run()
 
