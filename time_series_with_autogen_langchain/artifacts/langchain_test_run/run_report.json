@@ -1,0 +1,89 @@
+{
+  "run_id": "langchain_test_run",
+  "framework": "langchain",
+  "timestamp_utc": "2026-07-15T17:58:48.598358+00:00",
+  "request": {
+    "ticker": "MSFT",
+    "start_date": "2024-01-01",
+    "end_date": "2024-03-31"
+  },
+  "selected_source": "reuters",
+  "gap_method": "ffill_then_bfill",
+  "quality": [
+    {
+      "source": "bloomberg",
+      "rows": 65,
+      "missing_close": 0,
+      "duplicate_dates": 0,
+      "coverage_pct": 100.0,
+      "start_date": "2024-01-01",
+      "end_date": "2024-03-29"
+    },
+    {
+      "source": "reuters",
+      "rows": 65,
+      "missing_close": 1,
+      "duplicate_dates": 0,
+      "coverage_pct": 98.46153846153847,
+      "start_date": "2024-01-01",
+      "end_date": "2024-03-29"
+    },
+    {
+      "source": "yahoo",
+      "rows": 66,
+      "missing_close": 5,
+      "duplicate_dates": 1,
+      "coverage_pct": 92.42424242424242,
+      "start_date": "2024-01-01",
+      "end_date": "2024-03-29"
+    }
+  ],
+  "react_trace": [
+    {
+      "agent": "LangGraphNode",
+      "thought": "Need a request object before invoking tools.",
+      "action": "Tool: HumanInputTool",
+      "observation": "Received ticker=MSFT, start=2024-01-01, end=2024-03-31"
+    },
+    {
+      "agent": "LangGraphNode",
+      "thought": "Collect candidate datasets from all configured vendors.",
+      "action": "Tool: MarketDataTool",
+      "observation": "Collected 3 datasets"
+    },
+    {
+      "agent": "LangGraphNode",
+      "thought": "Assess source quality to support governance choice.",
+      "action": "Tool: DataQualityTool",
+      "observation": "Quality report completed"
+    },
+    {
+      "agent": "LangGraphNode",
+      "thought": "Human chooses which source to trust for construction.",
+      "action": "Tool: HumanApprovalTool",
+      "observation": "Selected source=reuters"
+    },
+    {
+      "agent": "LangGraphNode",
+      "thought": "Recommend a missing-data strategy before generation.",
+      "action": "Tool: GapAnalysisTool",
+      "observation": "Primary suggestion=linear"
+    },
+    {
+      "agent": "LangGraphNode",
+      "thought": "Human confirms method to keep process auditable.",
+      "action": "Tool: HumanApprovalTool",
+      "observation": "Selected gap_method=ffill_then_bfill"
+    },
+    {
+      "agent": "LangGraphNode",
+      "thought": "Produce final continuous series for downstream use.",
+      "action": "Tool: TimeSeriesGenerationTool",
+      "observation": "Generated rows=65"
+    }
+  ],
+  "artifacts": {
+    "quality_csv": "artifacts/langchain_test_run/quality_summary.csv",
+    "continuous_series_csv": "artifacts/langchain_test_run/continuous_series.csv"
+  }
+}

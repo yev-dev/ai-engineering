@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-OLLAMA_MODEL = (os.getenv("LLM_MODEL") or "ollama/gemma4:e4b").strip()
+OLLAMA_MODEL = (os.getenv("LLM_MODEL") or "ollama/gemma4:26b").strip()
 
 # ---------------------------------------------------------------------------
 # LLM call via ModelRequestFactory

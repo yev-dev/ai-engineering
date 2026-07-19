@@ -158,7 +158,7 @@ class TravelBookingCLI:
         print("=" * 60)
         print("  Travel Booking Agent System")
         print("  Powered by ReAct Agents + LangChain Callbacks")
-        print("  Ollama (gemma4:e4b) via litellm")
+        print("  Ollama via litellm")
         print("=" * 60)
         print()
         print("You can ask me to book cars, flights, or hotels.")

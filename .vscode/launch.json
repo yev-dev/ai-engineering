@@ -48,6 +48,44 @@
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Time Series Construction: CLI",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "time_series_construction.cli",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "LOG_LEVEL": "INFO"
+            }
+        },
+        {
+            "name": "Time Series Construction: pytest workflow",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "time_series_construction/tests/test_workflow.py",
+                "-q"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Time Series Construction: pytest integration",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "time_series_construction/tests/test_workflow_int.py",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }
