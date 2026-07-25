@@ -82,14 +82,12 @@ class TestCLISmoke:
         cli.main()
 
         events_path = output_root / session_id / "events.json"
+        trace_path = output_root / session_id / "react_trace.json"
         assert events_path.exists(), "Expected CLI to persist events.json artifact"
+        assert trace_path.exists(), "Expected CLI to persist react_trace.json artifact"
 
         events = json.loads(events_path.read_text())
-        pause_agents = [
-            entry["payload"].get("agent", "")
-            for entry in events
-            if entry.get("type") == "awaiting_user_input"
-        ]
+        trace_records = json.loads(trace_path.read_text())
         delegated_targets = [
             entry["payload"].get("to_agent", "")
             for entry in events
@@ -99,6 +97,17 @@ class TestCLISmoke:
         assert "ReferenceDataAgent" in delegated_targets, (
             "Expected follow-up to progress by delegating beyond Orchestrator."
         )
-        assert not pause_agents or pause_agents[-1] != "Orchestrator", (
-            "Expected next checkpoint after follow-up to not remain on Orchestrator."
+        completed_agents = [
+            entry["payload"].get("agent", "")
+            for entry in events
+            if entry.get("type") == "agent_completed"
+        ]
+        assert "ReferenceDataAgent" in completed_agents, (
+            "Expected workflow to progress beyond Orchestrator after follow-up."
+        )
+        assert any(record.get("type") == "llm_response" for record in trace_records)
+        assert any(
+            record.get("type") == "tool_call"
+            and record.get("payload", {}).get("description")
+            for record in trace_records
         )

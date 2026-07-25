@@ -1,6 +1,7 @@
 """Callback event bus and human-in-the-loop pause/resume state."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 from collections import deque
 from typing import Any
@@ -26,7 +27,31 @@ class TimeSeriesConstructionHandler:
         self.current_agent: str | None = None
         self.session_id = session_id
         self.react_trace: list[str] = []
+        self.trace_records: list[dict[str, Any]] = []
         logger.info("handler_initialized session_id=%s", session_id)
+
+    def add_trace_record(
+        self,
+        entry_type: str,
+        payload: dict[str, Any],
+        agent: str | None = None,
+        iteration: int | None = None,
+    ) -> None:
+        """Append a structured trace record for persistence and debugging."""
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": entry_type,
+            "agent": agent or self.current_agent,
+            "iteration": iteration,
+            "payload": payload,
+        }
+        self.trace_records.append(record)
+        logger.debug(
+            "trace_record_added session_id=%s type=%s agent=%s",
+            self.session_id,
+            entry_type,
+            record.get("agent"),
+        )
 
     def emit(self, event: CallbackEvent) -> None:
         """Emit a callback event to the queue."""
@@ -72,6 +97,11 @@ class TimeSeriesConstructionHandler:
         if context:
             payload["context"] = context
         self.emit(CallbackEvent(CallbackEventType.AWAITING_USER_INPUT, payload, self.session_id))
+        self.add_trace_record(
+            "awaiting_user_input",
+            payload,
+            agent=self.current_agent or "System",
+        )
         self.waiting_for_input = True
 
     def handle_user_response(self, user_input: str) -> dict[str, Any] | None:
@@ -105,12 +135,22 @@ class TimeSeriesConstructionHandler:
             return None
         if state is not None:
             state["user_response"] = user_input
+        self.add_trace_record(
+            "user_response",
+            {"content": user_input},
+            agent=(state or {}).get("agent", self.current_agent),
+            iteration=(state or {}).get("iteration"),
+        )
         return state
 
     def add_to_trace(self, text: str) -> None:
         """Add a ReACT trace entry for later export."""
         self.react_trace.append(text)
         logger.debug("trace_added session_id=%s length=%d", self.session_id, len(text))
+
+    def get_trace_records(self) -> list[dict[str, Any]]:
+        """Return structured trace records."""
+        return list(self.trace_records)
 
     def get_trace(self) -> str:
         """Get the full ReACT trace as a single string."""
@@ -157,6 +197,7 @@ class TimeSeriesConstructionHandler:
         self.paused_state = None
         self.current_agent = None
         self.react_trace.clear()
+        self.trace_records.clear()
 
 
 class CallbackProcessor:

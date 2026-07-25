@@ -1,0 +1,21 @@
+{
+  "require_no_errors": true,
+  "required_pauses": [
+    "ReportingAgent",
+    "GapFillingAgent"
+  ],
+  "required_completed_agents": [
+    "ReferenceDataAgent",
+    "MarketDataAgent",
+    "DataQualityAgent",
+    "ReportingAgent",
+    "GapFillingAgent"
+  ],
+  "required_delegations": [
+    {"from": "ReferenceDataAgent", "to": "MarketDataAgent"},
+    {"from": "MarketDataAgent", "to": "DataQualityAgent"},
+    {"from": "DataQualityAgent", "to": "ReportingAgent"},
+    {"from": "ReportingAgent", "to": "GapFillingAgent"}
+  ],
+  "min_llm_delegations": 0
+}

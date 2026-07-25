@@ -501,6 +501,19 @@ class TestFullWorkflow:
         assert "DataQualityAgent" in agent_names
         assert "ReportingAgent" not in agent_names  # paused before completion
 
+        data_quality_events = [
+            event for event in completed
+            if event.payload.get("agent") == "DataQualityAgent"
+        ]
+        assert data_quality_events, "Expected DataQualityAgent completion event"
+        quality_result = data_quality_events[-1].payload.get("result", {})
+        quality_report = quality_result.get("data_quality_report")
+        assert isinstance(quality_report, dict)
+        assert quality_report.get("report_type") == "data_quality_summary"
+        assert isinstance(quality_report.get("rows"), list)
+        assert quality_report.get("rows")[0]["source"] == "yahoo"
+        assert "summary" in quality_report
+
         # Should have an AWAITING_USER_INPUT event from ReportingAgent
         awaiting = [e for e in events if e.type == CallbackEventType.AWAITING_USER_INPUT]
         assert len(awaiting) == 1
@@ -566,6 +579,8 @@ class TestFullWorkflow:
             ),
             # ReportingAgent (resumed after user says "yahoo") → final answer
             "Final Answer: User selected yahoo as the data source for AAPL.",
+            # GapFillingAgent → narrative final answer triggers forced method-selection pause
+            "Final Answer: Gap filling can now proceed once a method is selected.",
         ]
 
         # Phase 1 – initial request pauses at ReportingAgent
@@ -615,11 +630,11 @@ class TestFullWorkflow:
         assert errors, "Expected an error for unresolved instrument APEL"
 
     def test_workflow_rejects_environment_command(self, mock_processor: TimeSeriesConstructionProcessor) -> None:
-        """Environment commands should be rejected with a clarification prompt."""
+        """Environment commands should be rejected with an explicit error."""
         events = mock_processor.process_user_request("conda activate myenv")
-        awaiting = [e for e in events if e.type == CallbackEventType.AWAITING_USER_INPUT]
-        assert len(awaiting) == 1
-        assert "conda environment" in awaiting[0].payload.get("prompt", "").lower()
+        errors = [e for e in events if e.type == CallbackEventType.ERROR]
+        assert len(errors) == 1
+        assert "conda environment" in errors[0].payload.get("message", "").lower()
 
     def test_workflow_rejects_non_financial_request(self, mock_processor: TimeSeriesConstructionProcessor) -> None:
         """Non-financial requests should trigger a clarification prompt."""
@@ -729,7 +744,9 @@ class TestFullWorkflow:
 
         assert delegated, "Expected direct delegation from Orchestrator"
         assert delegated[0].payload.get("to_agent") == "ReferenceDataAgent"
-        assert not pauses, "Did not expect initial Orchestrator clarification pause"
+        assert all(event.payload.get("agent") != "Orchestrator" for event in pauses), (
+            "Did not expect initial Orchestrator clarification pause"
+        )
         assert factory.seen_system_prompts, "Expected downstream agent LLM call"
         assert "Resolve the instrument" in factory.seen_system_prompts[0]
 
@@ -758,7 +775,9 @@ class TestFullWorkflow:
 
         assert delegated, "Expected direct delegation from Orchestrator"
         assert delegated[0].payload.get("to_agent") == "ReferenceDataAgent"
-        assert not pauses, "Did not expect initial Orchestrator clarification pause"
+        assert all(event.payload.get("agent") != "Orchestrator" for event in pauses), (
+            "Did not expect initial Orchestrator clarification pause"
+        )
 
     def test_explicit_agent_response_delegates_to_market_data(
         self,
@@ -850,6 +869,38 @@ class TestFullWorkflow:
             "Expected MarketDataAgent to be auto-delegated after ReferenceDataAgent completion"
         )
 
+    def test_reference_final_answer_without_tool_still_continues_to_market(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """ReferenceDataAgent final answers should not terminate the workflow early.
+
+        If the model returns a final resolution sentence (without any tool call),
+        the processor should still continue to MarketDataAgent.
+        """
+        mock_processor.factory.chat_sequence = [
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            "Final Answer: Market data retrieval started for AAPL.",
+        ]
+
+        events = mock_processor.process_user_request("Build AAPL from 2023-01-01 to 2023-12-31")
+
+        delegated_targets = [
+            event.payload.get("to_agent")
+            for event in events
+            if event.type == CallbackEventType.DELEGATED
+        ]
+        assert "MarketDataAgent" in delegated_targets
+
+        completed_agents = [
+            event.payload.get("agent")
+            for event in events
+            if event.type == CallbackEventType.AGENT_COMPLETED
+        ]
+        assert "ReferenceDataAgent" in completed_agents
+        assert "MarketDataAgent" in completed_agents
+
     def test_market_data_source_selection_final_is_bypassed(
         self,
         mock_data_dir: Path,
@@ -926,6 +977,209 @@ class TestFullWorkflow:
         ]
         assert "DataQualityAgent" in delegated_targets
 
+    def test_market_final_answer_without_tool_still_continues_to_quality(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """MarketDataAgent final answers should not terminate workflow early.
+
+        If MarketDataAgent returns a narrative final answer without explicit
+        historical_prices tool outputs, processor should still continue to
+        DataQualityAgent using deterministic fallback routing.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Resolve instrument.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            (
+                "Final Answer: Historical prices for Apple Inc. (AAPL) from 2023-01-01 "
+                "to 2024-01-01 have been retrieved successfully."
+            ),
+            "Final Answer: Data quality stage started.",
+        ]
+
+        events = mock_processor.process_user_request("AAPL from 2023-01-01 to 2024-01-01")
+
+        delegated_targets = [
+            event.payload.get("to_agent")
+            for event in events
+            if event.type == CallbackEventType.DELEGATED
+        ]
+        assert "MarketDataAgent" in delegated_targets
+        assert "DataQualityAgent" in delegated_targets
+
+        completed_agents = [
+            event.payload.get("agent")
+            for event in events
+            if event.type == CallbackEventType.AGENT_COMPLETED
+        ]
+        assert "MarketDataAgent" in completed_agents
+        assert "DataQualityAgent" in completed_agents
+
+    def test_reporting_final_answer_without_explicit_source_requires_pause(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """ReportingAgent should pause when no explicit source choice is provided.
+
+        A final answer that mentions multiple sources must not be treated as
+        a user selection.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Resolve instrument.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            (
+                "Final Answer: Historical prices for AAPL have been retrieved from "
+                "Yahoo, Bloomberg, and Reuters."
+            ),
+            "Final Answer: Quality metrics computed for yahoo, bloomberg, and reuters.",
+            (
+                "Thought: Present report and request explicit user source selection.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Choose source\", \"options\": [\"yahoo\", \"bloomberg\", \"reuters\"]}"
+            ),
+        ]
+
+        events = mock_processor.process_user_request("AAPL from 2023-01-01 to 2024-01-01")
+
+        delegated_targets = [
+            event.payload.get("to_agent")
+            for event in events
+            if event.type == CallbackEventType.DELEGATED
+        ]
+        assert "ReportingAgent" in delegated_targets
+        assert "GapFillingAgent" not in delegated_targets
+
+        pauses = [
+            event for event in events
+            if event.type == CallbackEventType.AWAITING_USER_INPUT
+        ]
+        assert pauses, "Expected explicit pause for source selection"
+        assert pauses[-1].payload.get("agent") == "ReportingAgent"
+
+    def test_reporting_narrative_final_answer_forces_source_selection_pause(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """Narrative ReportingAgent final answer must still trigger HITL pause.
+
+        Reproduces the case where ReportingAgent claims quality report is ready
+        but does not call request_human_input.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Resolve instrument.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            "Final Answer: Historical prices for AAPL have been retrieved successfully.",
+            "Final Answer: Data quality stage started.",
+            (
+                "Final Answer: A quality report has been generated for AAPL from Yahoo, "
+                "Bloomberg, and Reuters. The data is consistent across all sources."
+            ),
+        ]
+
+        events = mock_processor.process_user_request("AAPL from 2023-01-01 to 2024-01-01")
+
+        pauses = [
+            event for event in events
+            if event.type == CallbackEventType.AWAITING_USER_INPUT
+        ]
+        assert pauses, "Expected forced source-selection pause at ReportingAgent"
+        assert pauses[-1].payload.get("agent") == "ReportingAgent"
+
+        reporting_completed = [
+            event for event in events
+            if event.type == CallbackEventType.AGENT_COMPLETED
+            and event.payload.get("agent") == "ReportingAgent"
+        ]
+        assert not reporting_completed, "ReportingAgent should pause, not complete"
+
+    def test_gapfilling_narrative_final_answer_forces_method_selection_pause(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """GapFillingAgent narrative final answers must trigger HITL method pause."""
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Resolve instrument.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            "Final Answer: Historical prices for AAPL have been retrieved successfully.",
+            "Final Answer: Data quality stage started.",
+            "Final Answer: Quality report is ready. Please choose a source.",
+            "Final Answer: Source selection acknowledged. Delegating to gap-filling.",
+            "Final Answer: Gap filling can now proceed once a method is selected.",
+        ]
+
+        # Initial pass pauses at ReportingAgent for source selection.
+        first_events = mock_processor.process_user_request("AAPL from 2023-01-01 to 2024-01-01")
+        first_pauses = [e for e in first_events if e.type == CallbackEventType.AWAITING_USER_INPUT]
+        assert first_pauses and first_pauses[-1].payload.get("agent") == "ReportingAgent"
+
+        # Resume with explicit source; GapFillingAgent should then force method-selection pause.
+        second_events = mock_processor.process_user_response("yahoo")
+        second_pauses = [e for e in second_events if e.type == CallbackEventType.AWAITING_USER_INPUT]
+        assert second_pauses, "Expected forced method-selection pause at GapFillingAgent"
+        assert second_pauses[-1].payload.get("agent") == "GapFillingAgent"
+
+    def test_data_quality_malformed_delegate_payload_recovers_to_reporting(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """DataQualityAgent malformed delegate payload should not loop indefinitely.
+
+        When local model returns delegate_to_agent with empty target/request,
+        processor should recover deterministically and continue to ReportingAgent
+        source-selection checkpoint.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Resolve instrument.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            "Final Answer: Historical prices for AAPL have been retrieved successfully.",
+            (
+                "Thought: Continue to reporting.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"\", \"request\": \"\"}"
+            ),
+            "Final Answer: Quality report generated across sources.",
+        ]
+
+        events = mock_processor.process_user_request("AAPL from 2023-01-01 to 2024-01-01")
+
+        delegated_targets = [
+            event.payload.get("to_agent")
+            for event in events
+            if event.type == CallbackEventType.DELEGATED
+        ]
+        assert "ReportingAgent" in delegated_targets
+
+        pauses = [
+            event for event in events
+            if event.type == CallbackEventType.AWAITING_USER_INPUT
+        ]
+        assert pauses and pauses[-1].payload.get("agent") == "ReportingAgent"
+
 
 # ---------------------------------------------------------------------------
 # Tests – handler and callback processor
@@ -980,6 +1234,19 @@ class TestHandler:
         handler.add_to_trace("line1")
         handler.add_to_trace("line2")
         assert handler.get_trace() == "line1\nline2"
+
+    def test_handler_structured_trace_records(self) -> None:
+        """Structured trace records should be accumulated separately."""
+        from financial_time_series_construction.handler import TimeSeriesConstructionHandler
+
+        handler = TimeSeriesConstructionHandler(session_id="test")
+        handler.add_trace_record("llm_response", {"content": "Thought: test"}, agent="AgentA", iteration=0)
+        handler.add_trace_record("tool_call", {"tool": "check_data_quality"}, agent="AgentA", iteration=0)
+
+        records = handler.get_trace_records()
+        assert len(records) == 2
+        assert records[0]["type"] == "llm_response"
+        assert records[1]["payload"]["tool"] == "check_data_quality"
 
     def test_callback_processor(self) -> None:
         """CallbackProcessor should dispatch events to multiple handlers."""

@@ -17,13 +17,21 @@ from financial_time_series_construction.handler import TimeSeriesConstructionHan
 from financial_time_series_construction.models import LLMRequest, ModelRequestFactory
 from financial_time_series_construction.tools import (
     extract_date_range,
+    get_instrument_details,
     get_tool,
+    get_tool_description,
     normalize_date_range,
 )
 from financial_time_series_construction.prompts import (
     agent_system_prompt,
     request_prompt,
     unavailable_message,
+)
+from financial_time_series_construction.debug_logger import (
+    LoopDetector,
+    log_message_size,
+    log_workflow_progress,
+    timer,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +76,11 @@ class TimeSeriesConstructionProcessor:
         """
         user_input = user_input.strip()
         logger.info("request_received characters=%d", len(user_input))
+        self.handler.add_trace_record(
+            "user_request",
+            {"content": user_input},
+            agent="User",
+        )
 
         if self._is_environment_command(user_input):
             logger.warning("request_rejected reason=environment_command")
@@ -215,6 +228,275 @@ class TimeSeriesConstructionProcessor:
         if token_match:
             return token_match.group(0)
         return None
+
+    @staticmethod
+    def _extract_original_request_from_messages(messages: list[dict[str, str]]) -> str:
+        """Extract the original user request from enriched agent messages."""
+        all_user_text = " ".join(
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        ).strip()
+        original_match = re.search(r"original_request=(.+)", all_user_text)
+        return original_match.group(1).strip() if original_match else all_user_text
+
+    @staticmethod
+    def _extract_symbol_candidate_from_text(text: str) -> str | None:
+        """Extract a likely ticker symbol token from free-form text."""
+        if not text:
+            return None
+        # Prefer explicit symbol/ticker patterns before generic uppercase tokens.
+        explicit = re.search(
+            r"\b(?:symbol|ticker)\s*(?:is|=|:)?\s*([A-Za-z]{1,6})\b",
+            text,
+            re.IGNORECASE,
+        )
+        if explicit:
+            return explicit.group(1).upper()
+        generic = re.search(r"\b([A-Z]{1,6})\b", text)
+        if generic:
+            return generic.group(1)
+        return None
+
+    @staticmethod
+    def _extract_sources_from_text(text: str) -> list[str]:
+        """Extract known market data sources from free-form text."""
+        lowered = str(text or "").casefold()
+        found: list[str] = []
+        for source in ("yahoo", "bloomberg", "reuters"):
+            if source in lowered:
+                found.append(source)
+        return found
+
+    @staticmethod
+    def _extract_explicit_source_selection(text: str) -> str | None:
+        """Extract user-explicit source selection from text.
+
+        Returns a source only when exactly one supported source is present.
+        This avoids false positives from report text that lists all sources.
+        """
+        mentioned = TimeSeriesConstructionProcessor._extract_sources_from_text(text)
+        unique = sorted(set(mentioned))
+        if len(unique) == 1:
+            return unique[0]
+        return None
+
+    @staticmethod
+    def _log_continuation_decision(
+        agent: str,
+        iteration: int,
+        status: str,
+        detail: str,
+    ) -> None:
+        """Emit structured logs for continuation routing diagnostics."""
+        log_workflow_progress(agent, iteration, status, detail=detail)
+        logger.info(
+            "workflow_continuation agent=%s iteration=%d status=%s detail=%s",
+            agent,
+            iteration,
+            status,
+            detail,
+        )
+
+    @staticmethod
+    def _extract_quality_rows_from_messages(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+        """Extract quality rows from prior tool results or transfer context."""
+        rows: list[dict[str, Any]] = []
+
+        # First: direct tool results from check_data_quality.
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            try:
+                payload = json.loads(message["content"].replace("Tool result: ", "", 1))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("source") and "completeness_pct" in payload:
+                rows.append(payload)
+
+        # Fallback: parse delegated transfer context "Quality data: [...]".
+        if not rows:
+            for message in messages:
+                if message.get("role") != "user":
+                    continue
+                text = message.get("content", "")
+                match = re.search(
+                    r"Quality data:\s*(\[.*?\])(?:\s*\.\s*Original request:|$)",
+                    text,
+                    flags=re.DOTALL,
+                )
+                if not match:
+                    continue
+                try:
+                    parsed = json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict) and item.get("source"):
+                            rows.append(item)
+                if rows:
+                    break
+
+        # Deduplicate by source, preserving first occurrence.
+        deduped: list[dict[str, Any]] = []
+        seen_sources: set[str] = set()
+        for item in rows:
+            source = str(item.get("source", "")).strip().casefold()
+            if not source or source in seen_sources:
+                continue
+            seen_sources.add(source)
+            deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _build_reporting_selection_prompt(quality_rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
+        """Build a source-selection prompt from quality rows.
+
+        Returns:
+            (prompt_text, source_options)
+        """
+        if not quality_rows:
+            options = ["yahoo", "bloomberg", "reuters"]
+            prompt = (
+                "Data quality comparison is ready. Please choose one source to continue "
+                "to gap-filling: yahoo, bloomberg, or reuters."
+            )
+            return prompt, options
+
+        lines = [
+            "Data quality summary by source:",
+        ]
+        options: list[str] = []
+        for row in quality_rows:
+            source = str(row.get("source", "unknown")).strip().casefold()
+            options.append(source)
+            completeness = row.get("completeness_pct", "n/a")
+            missing = row.get("missing_count", row.get("nan_count", "n/a"))
+            issues = row.get("issues", [])
+            issue_text = ", ".join(str(item) for item in issues) if issues else "none"
+            lines.append(
+                f"- {source}: completeness={completeness}%, missing={missing}, issues={issue_text}"
+            )
+
+        lines.append("Select one source to continue to gap filling.")
+        return "\n".join(lines), options
+
+    @staticmethod
+    def _extract_explicit_gap_method(text: str) -> str | None:
+        """Extract an explicit gap-filling method choice from text."""
+        lowered = str(text or "").casefold()
+        aliases = {
+            "linear_interpolation": ["linear_interpolation", "linear interpolation"],
+            "forward_fill": ["forward_fill", "forward fill", "ffill"],
+            "backward_fill": ["backward_fill", "backward fill", "bfill"],
+            "none": ["none", "no filling", "skip"],
+        }
+        matched: list[str] = []
+        for canonical, values in aliases.items():
+            if any(value in lowered for value in values):
+                matched.append(canonical)
+        unique = sorted(set(matched))
+        return unique[0] if len(unique) == 1 else None
+
+    @staticmethod
+    def _extract_gap_method_options_from_messages(messages: list[dict[str, str]]) -> list[str]:
+        """Extract recommended gap methods from tool results if available."""
+        options: list[str] = []
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            content = message.get("content", "")
+            raw = content.replace("Tool result: ", "", 1)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, list):
+                for item in parsed:
+                    method = str(item).strip().casefold()
+                    if method in {
+                        "linear_interpolation",
+                        "forward_fill",
+                        "backward_fill",
+                        "none",
+                    }:
+                        options.append(method)
+
+        if not options:
+            return ["linear_interpolation", "forward_fill", "backward_fill", "none"]
+
+        return list(dict.fromkeys(options))
+
+    @staticmethod
+    def _build_gap_method_prompt(options: list[str]) -> str:
+        """Build a reusable method-selection prompt."""
+        formatted = ", ".join(options)
+        return (
+            "Please choose a gap-filling method to continue time-series construction. "
+            f"Available methods: {formatted}."
+        )
+
+    @staticmethod
+    def _build_data_quality_report(quality_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Build a JSON-serializable data quality report.
+
+        The rows payload is list-of-dicts so it can be serialized directly to a
+        DataFrame by downstream consumers.
+        """
+        normalized_rows: list[dict[str, Any]] = []
+        completeness_candidates: list[tuple[str, float]] = []
+        total_missing = 0
+        symbol = None
+
+        for item in quality_rows:
+            row = {
+                "source": item.get("source"),
+                "symbol": item.get("symbol"),
+                "total_values": item.get("total_values"),
+                "missing_count": item.get("missing_count", item.get("nan_count")),
+                "completeness_pct": item.get("completeness_pct"),
+                "duplicate_count": item.get("duplicate_count"),
+                "issues": item.get("issues", []),
+                "note": item.get("note"),
+            }
+            normalized_rows.append(row)
+
+            if symbol is None and row.get("symbol"):
+                symbol = row.get("symbol")
+
+            missing_value = row.get("missing_count")
+            if isinstance(missing_value, int):
+                total_missing += missing_value
+
+            completeness_value = row.get("completeness_pct")
+            if isinstance(completeness_value, (int, float)) and row.get("source"):
+                completeness_candidates.append((str(row["source"]), float(completeness_value)))
+
+        best_source = None
+        worst_source = None
+        average_completeness = None
+        if completeness_candidates:
+            best_source = max(completeness_candidates, key=lambda item: item[1])[0]
+            worst_source = min(completeness_candidates, key=lambda item: item[1])[0]
+            average_completeness = round(
+                sum(item[1] for item in completeness_candidates) / len(completeness_candidates),
+                2,
+            )
+
+        return {
+            "report_type": "data_quality_summary",
+            "rows": normalized_rows,
+            "summary": {
+                "symbol": symbol,
+                "source_count": len(normalized_rows),
+                "sources": [row.get("source") for row in normalized_rows if row.get("source")],
+                "total_missing_count": total_missing,
+                "average_completeness_pct": average_completeness,
+                "best_source_by_completeness": best_source,
+                "worst_source_by_completeness": worst_source,
+            },
+        }
 
     @staticmethod
     def _is_environment_command(user_input: str) -> bool:
@@ -418,32 +700,50 @@ class TimeSeriesConstructionProcessor:
 
         self.handler.current_agent = agent.name
         prompt = self._prompt(agent)
+        loop_detector = LoopDetector(max_repeats=3)
+        log_workflow_progress(agent.name, start, "started")
         logger.info("agent_started agent=%s iteration_start=%d", agent.name, start)
 
         for iteration in range(start, 10):
+            log_workflow_progress(agent.name, iteration, "llm_call")
             logger.info("agent_iteration agent=%s iteration=%d", agent.name, iteration)
 
-            # Get LLM response
+            # Log message size to track growing conversation history
+            log_message_size(agent.name, iteration, messages)
+
+            # Get LLM response with timing
             try:
-                response = self.factory.chat(
-                    LLMRequest(
-                        system_prompt=prompt,
-                        messages=messages,
-                        callbacks=[self.handler],
+                with timer(agent.name, iteration, "LLM call"):
+                    response = self.factory.chat(
+                        LLMRequest(
+                            system_prompt=prompt,
+                            messages=messages,
+                            callbacks=[self.handler],
+                        )
                     )
-                )
             except Exception as error:
                 self.handler.on_llm_error(error)
+                log_workflow_progress(agent.name, iteration, "error", detail=str(error))
                 return self._drain()
 
             # Record trace
             self.handler.add_to_trace(
                 f"[{agent.name}:{iteration}] {response}"
             )
+            self.handler.add_trace_record(
+                "llm_response",
+                {"content": response},
+                agent=agent.name,
+                iteration=iteration,
+            )
             messages.append({"role": "assistant", "content": response})
+
+            # Check for response loop (identical response as previous iteration)
+            loop_detector.record_response(agent.name, iteration, response)
 
             # Check for Final Answer
             if "Final Answer:" in response:
+                log_workflow_progress(agent.name, iteration, "final_answer", detail="llm_returned_final_answer")
                 if (
                     agent.name == "MarketDataAgent"
                     and self._looks_like_market_source_selection_final(response)
@@ -497,7 +797,19 @@ class TimeSeriesConstructionProcessor:
                     response, agent, messages, iteration, visited,
                 )
                 if continuation is not None:
+                    self._log_continuation_decision(
+                        agent.name,
+                        iteration,
+                        "delegating",
+                        "continued_after_final_answer",
+                    )
                     return continuation
+                self._log_continuation_decision(
+                    agent.name,
+                    iteration,
+                    "completed",
+                    "final_answer_without_continuation",
+                )
                 logger.info(
                     "agent_completed agent=%s iteration=%d", agent.name, iteration
                 )
@@ -541,9 +853,21 @@ class TimeSeriesConstructionProcessor:
                     }
                 )
                 continue
+                self.handler.add_trace_record(
+                    "final_answer",
+                    {"content": response.split("Final Answer:", 1)[1].strip()},
+                    agent=agent.name,
+                    iteration=iteration,
+                )
 
             # Execute each tool call
             for call in calls:
+                log_workflow_progress(
+                    agent.name,
+                    iteration,
+                    "tool_call",
+                    detail=call["name"],
+                )
                 result = self._execute(
                     call, agent, messages, prompt, iteration, visited,
                 )
@@ -551,6 +875,12 @@ class TimeSeriesConstructionProcessor:
                     return self._drain()
                 if self._is_event_list(result):
                     return result
+                log_workflow_progress(
+                    agent.name,
+                    iteration,
+                    "tool_result",
+                    detail=call["name"],
+                )
                 messages.append(
                     {
                         "role": "user",
@@ -575,7 +905,15 @@ class TimeSeriesConstructionProcessor:
         iteration: int,
         visited: set[str],
     ) -> list[CallbackEvent] | None:
-        """Recover when an LLM states delegation instead of calling the tool."""
+        """Recover when an LLM states delegation instead of calling the tool.
+
+        Catches three patterns:
+        1. Explicit mention of a registered agent name (e.g. "delegate to ReferenceDataAgent")
+        2. Generic delegation language (e.g. "delegate to agent")
+        3. "I will proceed" / "I will now" / "proceeding" — the Orchestrator
+           describing intent without calling any tool. In this case, delegate
+           to ReferenceDataAgent with the original user request.
+        """
         target = next(
             (
                 candidate
@@ -603,6 +941,26 @@ class TimeSeriesConstructionProcessor:
             and re.search(r"\bdelegate[_ -]?to[_ -]?agent\b", response, re.IGNORECASE)
         ):
             target = get_agent("ReferenceDataAgent")
+        # Catch "I will proceed" / "I will now" / "proceeding" patterns where
+        # the Orchestrator describes intent without calling any tool. This is
+        # common with deepseek-v2:16b which sometimes summarises instead of
+        # executing. Delegate to ReferenceDataAgent with the original request.
+        if (
+            agent.name == "Orchestrator"
+            and target is None
+            and re.search(
+                r"\b(?:i will now|i will proceed|proceeding|i shall|"
+                r"i will begin|starting the|beginning the)\b",
+                response,
+                re.IGNORECASE,
+            )
+        ):
+            target = get_agent("ReferenceDataAgent")
+            logger.warning(
+                "orchestrator_proceed_recovered mode=heuristic target=%s iteration=%d "
+                "reason=llm_described_intent_without_tool_call",
+                target.name, iteration,
+            )
         if target is None:
             return None
         logger.warning(
@@ -627,11 +985,18 @@ class TimeSeriesConstructionProcessor:
         iteration: int,
         visited: set[str],
     ) -> list[CallbackEvent] | None:
-        """Auto-delegate from ReferenceDataAgent to MarketDataAgent after instrument resolution.
+        """Auto-delegate to the next agent in the workflow chain after agent completion.
 
-        When ReferenceDataAgent completes with a Final Answer that includes a resolved
-        instrument symbol, this method automatically delegates to MarketDataAgent to
-        continue the workflow without returning to the user for input.
+        When an agent completes with a Final Answer instead of calling delegate_to_agent,
+        this method automatically delegates to the next appropriate agent to continue
+        the workflow without returning to the user for input.
+
+        Supported continuations:
+        - ReferenceDataAgent → MarketDataAgent (when instrument is resolved)
+        - MarketDataAgent → DataQualityAgent (when market data has been loaded)
+        - DataQualityAgent → ReportingAgent (when quality metrics are computed)
+        - ReportingAgent → GapFillingAgent (when user has selected a source)
+        - GapFillingAgent → TimeSeriesConstructionAgent (when gap-filling is applied)
 
         Args:
             response: The LLM response containing the Final Answer.
@@ -643,12 +1008,43 @@ class TimeSeriesConstructionProcessor:
         Returns:
             List of CallbackEvents if continuation was triggered, None otherwise.
         """
-        if agent.name != "ReferenceDataAgent":
-            return None
+        # --- ReferenceDataAgent → MarketDataAgent ---
+        if agent.name == "ReferenceDataAgent":
+            return self._continue_reference_to_market(response, agent, messages, iteration, visited)
 
-        # Check if the final answer contains a resolved instrument symbol
-        final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
+        # --- MarketDataAgent → DataQualityAgent ---
+        if agent.name == "MarketDataAgent":
+            return self._continue_market_to_quality(response, agent, messages, iteration, visited)
 
+        # --- DataQualityAgent → ReportingAgent ---
+        if agent.name == "DataQualityAgent":
+            return self._continue_quality_to_reporting(response, agent, messages, iteration, visited)
+
+        # --- ReportingAgent → GapFillingAgent ---
+        if agent.name == "ReportingAgent":
+            return self._continue_reporting_to_gapfilling(response, agent, messages, iteration, visited)
+
+        # --- GapFillingAgent → TimeSeriesConstructionAgent ---
+        if agent.name == "GapFillingAgent":
+            return self._continue_gapfilling_to_construction(response, agent, messages, iteration, visited)
+
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "completed",
+            "no_continuation_rule_for_agent",
+        )
+        return None
+
+    def _continue_reference_to_market(
+        self,
+        response: str,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        visited: set[str],
+    ) -> list[CallbackEvent] | None:
+        """Auto-delegate from ReferenceDataAgent to MarketDataAgent after instrument resolution."""
         # Look for a resolved symbol in the tool results in messages
         resolved_symbol = None
         for message in messages:
@@ -661,24 +1057,63 @@ class TimeSeriesConstructionProcessor:
                 except (json.JSONDecodeError, KeyError):
                     continue
 
+        original_request = self._extract_original_request_from_messages(messages)
+
+        # Fallback: some models emit a terminal "Final Answer" without calling tools.
+        # Recover symbol from the final answer or original request to continue the flow.
         if not resolved_symbol:
+            final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
+            recovered = self._extract_symbol_candidate_from_text(final_text)
+            if recovered:
+                resolved_symbol = recovered
+                logger.info(
+                    "reference_symbol_recovered source=final_answer symbol=%s iteration=%d",
+                    resolved_symbol,
+                    iteration,
+                )
+
+        if not resolved_symbol:
+            inferred_query = self._extract_instrument_query(original_request)
+            if inferred_query:
+                try:
+                    inferred_result = get_instrument_details(query=inferred_query)
+                    if inferred_result.get("found") and inferred_result.get("symbol"):
+                        resolved_symbol = str(inferred_result["symbol"])
+                        logger.info(
+                            "reference_symbol_recovered source=deterministic_tool symbol=%s query=%s iteration=%d",
+                            resolved_symbol,
+                            inferred_query,
+                            iteration,
+                        )
+                except Exception as error:
+                    logger.debug(
+                        "reference_symbol_recovery_tool_failed query=%s error=%s",
+                        inferred_query,
+                        error,
+                    )
+
+        if not resolved_symbol:
+            recovered = self._extract_symbol_candidate_from_text(original_request)
+            if recovered:
+                resolved_symbol = recovered
+                logger.info(
+                    "reference_symbol_recovered source=original_request symbol=%s iteration=%d",
+                    resolved_symbol,
+                    iteration,
+                )
+
+        if not resolved_symbol:
+            self._log_continuation_decision(
+                agent.name,
+                iteration,
+                "completed",
+                "reference_to_market_skipped_missing_symbol",
+            )
             return None
 
         market_agent = get_agent("MarketDataAgent")
         if market_agent is None:
             return None
-
-        # Build the transfer request preserving the original user request context
-        all_user_text = " ".join(
-            msg.get("content", "")
-            for msg in messages
-            if msg.get("role") == "user"
-        ).strip()
-        original_match = re.search(r"original_request=(.+)", all_user_text)
-        if original_match:
-            original_request = original_match.group(1).strip()
-        else:
-            original_request = all_user_text
 
         transfer_request = (
             f"Retrieve historical prices for {resolved_symbol}. "
@@ -689,6 +1124,12 @@ class TimeSeriesConstructionProcessor:
             "reference_auto_continue mode=deterministic to_agent=%s symbol=%s reason=reference_agent_completed_with_resolved_instrument",
             market_agent.name,
             resolved_symbol,
+        )
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "delegating",
+            f"reference_to_market symbol={resolved_symbol}",
         )
 
         continuation_events = [
@@ -712,6 +1153,491 @@ class TimeSeriesConstructionProcessor:
 
         target_result = self._run_agent(
             market_agent,
+            [{"role": "user", "content": transfer_request}],
+            visited=visited.copy(),
+        )
+
+        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+
+    def _continue_market_to_quality(
+        self,
+        response: str,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        visited: set[str],
+    ) -> list[CallbackEvent] | None:
+        """Auto-delegate from MarketDataAgent to DataQualityAgent after data loading.
+
+        Checks if market data was successfully loaded from at least one source
+        by looking for historical_prices tool results in the conversation.
+        """
+        # Look for loaded data sources in tool results
+        loaded_sources = []
+        resolved_symbol = None
+        for message in messages:
+            if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
+                try:
+                    tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
+                    if isinstance(tool_result, dict) and tool_result.get("dates") and tool_result.get("source"):
+                        loaded_sources.append(tool_result["source"])
+                        if not resolved_symbol and tool_result.get("symbol"):
+                            resolved_symbol = tool_result["symbol"]
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        original_request = self._extract_original_request_from_messages(messages)
+        final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
+
+        if not resolved_symbol:
+            resolved_symbol = self._extract_symbol_candidate_from_text(final_text)
+        if not resolved_symbol:
+            resolved_symbol = self._extract_symbol_candidate_from_text(original_request)
+
+        if not loaded_sources:
+            loaded_sources = self._extract_sources_from_text(final_text)
+        if not loaded_sources:
+            loaded_sources = self._extract_sources_from_text(original_request)
+        if not loaded_sources and resolved_symbol:
+            # Deterministic fallback: proceed with known universe when the model
+            # summarized success but omitted explicit tool calls.
+            loaded_sources = ["yahoo", "bloomberg", "reuters"]
+            logger.warning(
+                "market_sources_recovered mode=deterministic symbol=%s sources=%s reason=final_answer_without_tool_results",
+                resolved_symbol,
+                loaded_sources,
+            )
+
+        if not loaded_sources:
+            self._log_continuation_decision(
+                agent.name,
+                iteration,
+                "completed",
+                "market_to_quality_skipped_missing_sources",
+            )
+            return None
+
+        quality_agent = get_agent("DataQualityAgent")
+        if quality_agent is None:
+            return None
+
+        transfer_request = (
+            f"Check data quality for {resolved_symbol or 'the instrument'} "
+            f"from sources: {', '.join(loaded_sources)}. "
+            f"Original request: {original_request}"
+        )
+
+        logger.info(
+            "market_auto_continue mode=deterministic to_agent=%s symbol=%s sources=%s reason=market_agent_completed_with_loaded_data",
+            quality_agent.name,
+            resolved_symbol,
+            loaded_sources,
+        )
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "delegating",
+            f"market_to_quality symbol={resolved_symbol or 'unknown'} sources={','.join(loaded_sources)}",
+        )
+
+        continuation_events = [
+            CallbackEvent(
+                CallbackEventType.AGENT_COMPLETED,
+                {"agent": agent.name, "result": {"delegated_to": quality_agent.name}},
+                self.handler.session_id,
+            ),
+            CallbackEvent(
+                CallbackEventType.DELEGATED,
+                {
+                    "from_agent": agent.name,
+                    "to_agent": quality_agent.name,
+                    "request": transfer_request,
+                    "routing_mode": "deterministic",
+                    "routing_reason": "bypassed user prompt: MarketDataAgent completed with loaded data, auto-delegating to DataQualityAgent",
+                },
+                self.handler.session_id,
+            ),
+        ]
+
+        target_result = self._run_agent(
+            quality_agent,
+            [{"role": "user", "content": transfer_request}],
+            visited=visited.copy(),
+        )
+
+        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+
+    def _continue_quality_to_reporting(
+        self,
+        response: str,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        visited: set[str],
+    ) -> list[CallbackEvent] | None:
+        """Auto-delegate from DataQualityAgent to ReportingAgent after quality checks.
+
+        Checks if quality metrics were computed for at least one source
+        by looking for check_data_quality tool results in the conversation.
+        """
+        # Look for quality check results in tool results
+        quality_sources = []
+        for message in messages:
+            if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
+                try:
+                    tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
+                    if isinstance(tool_result, dict) and "completeness_pct" in tool_result and tool_result.get("source"):
+                        quality_sources.append(tool_result)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        if not quality_sources:
+            # Fallback: continue with instruction to produce comparison + source selection,
+            # even when the model omitted explicit check_data_quality tool calls.
+            original_request = self._extract_original_request_from_messages(messages)
+            symbol_guess = self._extract_symbol_candidate_from_text(response)
+            if not symbol_guess:
+                symbol_guess = self._extract_symbol_candidate_from_text(original_request)
+            quality_sources = [
+                {
+                    "source": "yahoo",
+                    "symbol": symbol_guess or "UNKNOWN",
+                    "note": "fallback_context_only",
+                },
+                {
+                    "source": "bloomberg",
+                    "symbol": symbol_guess or "UNKNOWN",
+                    "note": "fallback_context_only",
+                },
+                {
+                    "source": "reuters",
+                    "symbol": symbol_guess or "UNKNOWN",
+                    "note": "fallback_context_only",
+                },
+            ]
+            logger.warning(
+                "quality_metrics_recovered mode=deterministic symbol=%s reason=final_answer_without_tool_results",
+                symbol_guess,
+            )
+
+        reporting_agent = get_agent("ReportingAgent")
+        if reporting_agent is None:
+            return None
+
+        # Build transfer request with quality context
+        all_user_text = " ".join(
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        ).strip()
+        original_match = re.search(r"original_request=(.+)", all_user_text)
+        original_request = original_match.group(1).strip() if original_match else all_user_text
+
+        transfer_request = (
+            f"Present quality report and ask the user to select a source. "
+            f"Quality data: {json.dumps(quality_sources)}. "
+            f"Original request: {original_request}"
+        )
+
+        logger.info(
+            "quality_auto_continue mode=deterministic to_agent=%s sources=%d reason=quality_agent_completed_with_metrics",
+            reporting_agent.name,
+            len(quality_sources),
+        )
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "delegating",
+            f"quality_to_reporting sources={len(quality_sources)}",
+        )
+
+        quality_report = self._build_data_quality_report(quality_sources)
+
+        continuation_events = [
+            CallbackEvent(
+                CallbackEventType.AGENT_COMPLETED,
+                {
+                    "agent": agent.name,
+                    "result": {
+                        "delegated_to": reporting_agent.name,
+                        "data_quality_report": quality_report,
+                    },
+                },
+                self.handler.session_id,
+            ),
+            CallbackEvent(
+                CallbackEventType.DELEGATED,
+                {
+                    "from_agent": agent.name,
+                    "to_agent": reporting_agent.name,
+                    "request": transfer_request,
+                    "routing_mode": "deterministic",
+                    "routing_reason": "bypassed user prompt: DataQualityAgent completed with quality metrics, auto-delegating to ReportingAgent",
+                },
+                self.handler.session_id,
+            ),
+        ]
+
+        target_result = self._run_agent(
+            reporting_agent,
+            [{"role": "user", "content": transfer_request}],
+            visited=visited.copy(),
+        )
+
+        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+
+    def _continue_reporting_to_gapfilling(
+        self,
+        response: str,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        visited: set[str],
+    ) -> list[CallbackEvent] | None:
+        """Auto-delegate from ReportingAgent to GapFillingAgent after user selects a source.
+
+        Checks if the user has provided a source selection in the conversation
+        (either via the paused state user_response or in the final answer).
+        """
+        # Check if the final answer or explicit user response contains a source selection
+        final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
+
+        # Look for a selected source in the conversation
+        selected_source = None
+        resolved_symbol = None
+
+        # If not found in paused state, only inspect the latest user message
+        # (explicit response after prompt). Do not scan all history because
+        # transfer/context messages may contain all source names.
+        if not selected_source:
+            last_user_message = next(
+                (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
+                "",
+            )
+            selected_source = self._extract_explicit_source_selection(last_user_message)
+
+        # Also check final answer if the model explicitly states one selected source.
+        if not selected_source:
+            selected_source = self._extract_explicit_source_selection(final_text)
+
+        if not selected_source:
+            self._log_continuation_decision(
+                agent.name,
+                iteration,
+                "pausing",
+                "reporting_requires_user_source_selection",
+            )
+            quality_rows = self._extract_quality_rows_from_messages(messages)
+            prompt, options = self._build_reporting_selection_prompt(quality_rows)
+            self.handler.request_human_input(
+                prompt,
+                options=options,
+                context={"quality_rows": quality_rows, "checkpoint": "source_selection"},
+            )
+            self.handler.paused_state = {
+                "agent": agent.name,
+                "messages": messages.copy(),
+                "iteration": iteration + 1,
+            }
+            logger.info(
+                "reporting_forced_pause mode=deterministic iteration=%d options=%s reason=missing_explicit_source_selection",
+                iteration,
+                options,
+            )
+            return self._drain()
+
+        # Extract symbol from tool results in messages
+        for message in messages:
+            if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
+                try:
+                    tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
+                    if isinstance(tool_result, dict) and tool_result.get("symbol"):
+                        resolved_symbol = tool_result["symbol"]
+                        break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        gap_agent = get_agent("GapFillingAgent")
+        if gap_agent is None:
+            return None
+
+        all_user_text = " ".join(
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        ).strip()
+        original_match = re.search(r"original_request=(.+)", all_user_text)
+        original_request = original_match.group(1).strip() if original_match else all_user_text
+
+        transfer_request = (
+            f"Apply gap-filling to {resolved_symbol or 'the instrument'} "
+            f"using source {selected_source}. "
+            f"Original request: {original_request}"
+        )
+
+        logger.info(
+            "reporting_auto_continue mode=deterministic to_agent=%s source=%s symbol=%s reason=reporting_agent_completed_with_source_selection",
+            gap_agent.name,
+            selected_source,
+            resolved_symbol,
+        )
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "delegating",
+            f"reporting_to_gapfilling source={selected_source}",
+        )
+
+        continuation_events = [
+            CallbackEvent(
+                CallbackEventType.AGENT_COMPLETED,
+                {"agent": agent.name, "result": {"delegated_to": gap_agent.name}},
+                self.handler.session_id,
+            ),
+            CallbackEvent(
+                CallbackEventType.DELEGATED,
+                {
+                    "from_agent": agent.name,
+                    "to_agent": gap_agent.name,
+                    "request": transfer_request,
+                    "routing_mode": "deterministic",
+                    "routing_reason": "bypassed user prompt: ReportingAgent completed with source selection, auto-delegating to GapFillingAgent",
+                },
+                self.handler.session_id,
+            ),
+        ]
+
+        target_result = self._run_agent(
+            gap_agent,
+            [{"role": "user", "content": transfer_request}],
+            visited=visited.copy(),
+        )
+
+        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+
+    def _continue_gapfilling_to_construction(
+        self,
+        response: str,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        visited: set[str],
+    ) -> list[CallbackEvent] | None:
+        """Auto-delegate from GapFillingAgent to TimeSeriesConstructionAgent after gap-filling.
+
+        Checks if a gap-filling method was applied by looking for apply_gap_filling
+        tool results in the conversation.
+        """
+        # Look for gap-filling results in tool results
+        filled_data = None
+        final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
+        for message in messages:
+            if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
+                try:
+                    tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
+                    if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("prices"):
+                        filled_data = tool_result
+                        break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        if not filled_data:
+            selected_method = None
+            last_user_message = next(
+                (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
+                "",
+            )
+            selected_method = self._extract_explicit_gap_method(last_user_message)
+            if not selected_method:
+                selected_method = self._extract_explicit_gap_method(final_text)
+
+            if selected_method:
+                self._log_continuation_decision(
+                    agent.name,
+                    iteration,
+                    "completed",
+                    f"gapfilling_explicit_method_detected_without_filled_data method={selected_method}",
+                )
+                return None
+
+            self._log_continuation_decision(
+                agent.name,
+                iteration,
+                "pausing",
+                "gapfilling_requires_method_or_filled_data",
+            )
+            options = self._extract_gap_method_options_from_messages(messages)
+            prompt = self._build_gap_method_prompt(options)
+            self.handler.request_human_input(
+                prompt,
+                options=options,
+                context={"checkpoint": "gap_method_selection"},
+            )
+            self.handler.paused_state = {
+                "agent": agent.name,
+                "messages": messages.copy(),
+                "iteration": iteration + 1,
+            }
+            logger.info(
+                "gapfilling_forced_pause mode=deterministic iteration=%d options=%s reason=missing_explicit_method_selection",
+                iteration,
+                options,
+            )
+            return self._drain()
+
+        construction_agent = get_agent("TimeSeriesConstructionAgent")
+        if construction_agent is None:
+            return None
+
+        all_user_text = " ".join(
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        ).strip()
+        original_match = re.search(r"original_request=(.+)", all_user_text)
+        original_request = original_match.group(1).strip() if original_match else all_user_text
+
+        transfer_request = (
+            f"Build and persist the final time series for {filled_data.get('symbol', 'the instrument')} "
+            f"using {filled_data.get('method', 'the selected')} gap-filling method. "
+            f"Filled data: {json.dumps(filled_data)}. "
+            f"Original request: {original_request}"
+        )
+
+        logger.info(
+            "gapfilling_auto_continue mode=deterministic to_agent=%s symbol=%s method=%s reason=gapfilling_agent_completed_with_filled_data",
+            construction_agent.name,
+            filled_data.get("symbol"),
+            filled_data.get("method"),
+        )
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "delegating",
+            f"gapfilling_to_construction symbol={filled_data.get('symbol')} method={filled_data.get('method')}",
+        )
+
+        continuation_events = [
+            CallbackEvent(
+                CallbackEventType.AGENT_COMPLETED,
+                {"agent": agent.name, "result": {"delegated_to": construction_agent.name}},
+                self.handler.session_id,
+            ),
+            CallbackEvent(
+                CallbackEventType.DELEGATED,
+                {
+                    "from_agent": agent.name,
+                    "to_agent": construction_agent.name,
+                    "request": transfer_request,
+                    "routing_mode": "deterministic",
+                    "routing_reason": "bypassed user prompt: GapFillingAgent completed with filled data, auto-delegating to TimeSeriesConstructionAgent",
+                },
+                self.handler.session_id,
+            ),
+        ]
+
+        target_result = self._run_agent(
+            construction_agent,
             [{"role": "user", "content": transfer_request}],
             visited=visited.copy(),
         )
@@ -742,6 +1668,7 @@ class TimeSeriesConstructionProcessor:
         """
         name, args = call["name"], call["arguments"]
         args = self._normalize_tool_args(name, args)
+        tool_description = get_tool_description(name)
         if name == "get_instrument_details":
             query_value = str(args.get("query", "")).strip()
             if not query_value:
@@ -762,11 +1689,28 @@ class TimeSeriesConstructionProcessor:
         logger.info(
             "tool_started agent=%s tool=%s iteration=%d", agent.name, name, iteration,
         )
+        logger.info(
+            "workflow_tool agent=%s iteration=%d tool=%s phase=start description=%s",
+            agent.name,
+            iteration,
+            name,
+            tool_description or "",
+        )
         logger.debug(
             "tool_arguments agent=%s tool=%s keys=%s",
             agent.name,
             name,
             sorted(args.keys()),
+        )
+        self.handler.add_trace_record(
+            "tool_call",
+            {
+                "tool": name,
+                "description": tool_description,
+                "arguments": args,
+            },
+            agent=agent.name,
+            iteration=iteration,
         )
 
         if name == "request_human_input":
@@ -879,23 +1823,63 @@ class TimeSeriesConstructionProcessor:
             return None
 
         if name == "delegate_to_agent":
-            target_name = str(args.get("agent_name", ""))
-            target = get_agent(target_name)
+            target_name = str(args.get("agent_name", "")).strip()
+            target = get_agent(target_name) if target_name else None
+            delegated_request = str(args.get("request", "")).strip()
+
+            # Recovery path: local models may emit malformed delegation payloads
+            # (empty target or empty request). Prefer deterministic continuation
+            # to the next workflow stage instead of re-entering an LLM loop.
+            if target is None or not delegated_request:
+                continuation = self._continue_after_agent_completion(
+                    response="",
+                    agent=agent,
+                    messages=messages,
+                    iteration=iteration,
+                    visited=visited,
+                )
+                if continuation is not None:
+                    logger.warning(
+                        "agent_delegation_recovered mode=deterministic from_agent=%s target=%s has_request=%s reason=malformed_delegate_payload",
+                        agent.name,
+                        target_name,
+                        bool(delegated_request),
+                    )
+                    return continuation
+
             if target is None:
                 logger.error(
                     "agent_delegation_failed agent=%s target=%s",
                     agent.name, target_name,
+                )
+                self.handler.add_trace_record(
+                    "tool_result",
+                    {
+                        "tool": name,
+                        "description": tool_description,
+                        "result": {"error": "Unknown target agent."},
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
                 )
                 return {"error": "Unknown target agent."}
             logger.info(
                 "agent_delegated from_agent=%s to_agent=%s",
                 agent.name, target.name,
             )
+            completion_result: dict[str, Any] = {"delegated_to": target.name}
+            if agent.name == "DataQualityAgent":
+                quality_rows = self._extract_quality_rows_from_messages(messages)
+                if quality_rows:
+                    completion_result["data_quality_report"] = self._build_data_quality_report(
+                        quality_rows
+                    )
+
             # Build delegation events directly (not via handler queue)
             delegation_events = [
                 CallbackEvent(
                     CallbackEventType.AGENT_COMPLETED,
-                    {"agent": agent.name, "result": {"delegated_to": target.name}},
+                    {"agent": agent.name, "result": completion_result},
                     self.handler.session_id,
                 ),
                 CallbackEvent(
@@ -903,7 +1887,7 @@ class TimeSeriesConstructionProcessor:
                     {
                         "from_agent": agent.name,
                         "to_agent": target.name,
-                        "request": str(args.get("request", "")),
+                        "request": delegated_request,
                         "routing_mode": "llm",
                         "routing_reason": "delegated by agent reasoning",
                     },
@@ -911,8 +1895,17 @@ class TimeSeriesConstructionProcessor:
                 ),
             ]
 
-            delegated_request = str(args.get("request", "")).strip()
             if not delegated_request:
+                self.handler.add_trace_record(
+                    "tool_result",
+                    {
+                        "tool": name,
+                        "description": tool_description,
+                        "result": {"error": "Delegation request is empty."},
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
+                )
                 return {"error": "Delegation request is empty."}
 
             # Run target agent
@@ -940,6 +1933,23 @@ class TimeSeriesConstructionProcessor:
                 "tool_completed agent=%s tool=%s result_type=%s",
                 agent.name, name, type(result).__name__,
             )
+            logger.info(
+                "workflow_tool agent=%s iteration=%d tool=%s phase=completed description=%s",
+                agent.name,
+                iteration,
+                name,
+                tool_description or "",
+            )
+            self.handler.add_trace_record(
+                "tool_result",
+                {
+                    "tool": name,
+                    "description": tool_description,
+                    "result": result,
+                },
+                agent=agent.name,
+                iteration=iteration,
+            )
             failure = self._tool_failure(name, result)
             if failure:
                 return [failure]
@@ -947,6 +1957,16 @@ class TimeSeriesConstructionProcessor:
         except Exception as error:
             self.handler.on_tool_error(error)
             logger.exception("tool_failed agent=%s tool=%s", agent.name, name)
+            self.handler.add_trace_record(
+                "tool_error",
+                {
+                    "tool": name,
+                    "description": tool_description,
+                    "error": str(error),
+                },
+                agent=agent.name,
+                iteration=iteration,
+            )
             return [self._user_error(name, str(error))]
 
     @staticmethod

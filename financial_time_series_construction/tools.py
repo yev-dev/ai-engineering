@@ -21,6 +21,12 @@ OUTPUT_ROOT = Path(os.getenv("TIME_SERIES_OUTPUT_DIR", Path.home() / "time_serie
 SOURCES = ("yahoo", "bloomberg", "reuters")
 logger = logging.getLogger(__name__)
 
+
+def _log_tool_progress(tool_name: str, phase: str, **kwargs: Any) -> None:
+    """Emit structured tool progress logs for workflow diagnostics."""
+    details = " ".join(f"{key}={value}" for key, value in kwargs.items())
+    logger.info("tool_progress tool=%s phase=%s %s", tool_name, phase, details)
+
 _MONTH_WORD_RE = re.compile(
     r"^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
     r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
@@ -30,13 +36,29 @@ _MONTH_WORD_RE = re.compile(
 _MONTH_NUM_RE = re.compile(r"^(\d{1,2})[/-](\d{4})$")
 _YEAR_RE = re.compile(r"^\d{4}$")
 _QUARTER_RE = re.compile(r"^(?:q([1-4])\s*(\d{4})|(\d{4})\s*q([1-4]))$", re.IGNORECASE)
+# Pre-compute common typos for "between" so users don't need exact spelling.
+_BETWEEN_TYPOS = "|".join([
+    "between",       # correct
+    "betwne",        # missing one 'e'
+    "betwen",        # missing one 'e'
+    "betwene",       # extra 'e'
+    "betwee",        # missing 'n'
+    "betweem",       # 'm' instead of 'n'
+    "betweeen",      # triple 'e'
+    "beteen",        # missing 'w'
+    "beteween",      # swapped 'we'
+    "btween",        # missing 'e'
+    "beetween",      # extra 'e'
+    "bwtween",       # swapped 'we'
+])
+
 _RANGE_PATTERNS = (
     re.compile(
         r"\bfrom\s+(?P<start>.+?)\s+(?:to|until|through|thru|till)\s+(?P<end>.+)$",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bbetween\s+(?P<start>.+?)\s+(?:and|to|until|through|thru|till)\s+(?P<end>.+)$",
+        rf"\b(?:{_BETWEEN_TYPOS})\s+(?P<start>.+?)\s+(?:and|to|until|through|thru|till)\s+(?P<end>.+)$",
         re.IGNORECASE,
     ),
     re.compile(
@@ -613,6 +635,12 @@ def delegate_to_agent(agent_name: str, request: str) -> dict[str, str]:
     Returns:
         Dict with delegation status.
     """
+    _log_tool_progress(
+        "delegate_to_agent",
+        "completed",
+        agent_name=agent_name,
+        request_chars=len(request or ""),
+    )
     return {"status": "delegating", "agent_name": agent_name, "request": request}
 
 
@@ -631,6 +659,13 @@ def request_human_input(
     Returns:
         Dict with the prompt and options for the human-in-the-loop handler.
     """
+    _log_tool_progress(
+        "request_human_input",
+        "completed",
+        options=len(options or []),
+        has_context=bool(context),
+        prompt_chars=len(prompt or ""),
+    )
     result: dict[str, Any] = {"prompt": prompt, "requires_input": True}
     if options:
         result["options"] = options
@@ -716,3 +751,11 @@ TOOL_REGISTRY: dict[str, StructuredTool] = {
 def get_tool(name: str) -> StructuredTool | None:
     """Retrieve a tool by name from the registry."""
     return TOOL_REGISTRY.get(name)
+
+
+def get_tool_description(name: str) -> str | None:
+    """Return a tool description from the registry if available."""
+    tool = TOOL_REGISTRY.get(name)
+    if tool is None:
+        return None
+    return str(getattr(tool, "description", "") or "").strip() or None
