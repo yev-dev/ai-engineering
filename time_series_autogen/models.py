@@ -1,8 +1,8 @@
-"""Small LiteLLM factory shared by the processor and future adapters."""
+"""LiteLLM factory for Ollama and GitHub Copilot clients via factory pattern."""
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,16 +13,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LLMRequest:
-    model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "ollama/llama3.2"))
+    """Data class representing a request to an LLM."""
+    model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "ollama/gemma4:26b"))
     temperature: float = 0.1
     max_tokens: int = 2048
     system_prompt: str = ""
     messages: list[dict[str, str]] = field(default_factory=list)
-    tools: list[Any] | None = None
     callbacks: list[Any] | None = None
 
     def kwargs(self) -> dict[str, Any]:
-        messages = ([{"role": "system", "content": self.system_prompt}] if self.system_prompt else [])
+        """Build the kwargs dict for litellm.completion."""
+        messages = (
+            [{"role": "system", "content": self.system_prompt}]
+            if self.system_prompt
+            else []
+        )
         messages.extend(self.messages)
         result: dict[str, Any] = {
             "model": self.model,
@@ -30,22 +35,30 @@ class LLMRequest:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
-        if self.tools:
-            result["tools"] = self.tools
         if self.callbacks:
             result["callbacks"] = self.callbacks
         return result
 
 
 class ModelRequestFactory:
-    """Provider-neutral wrapper; LiteLLM selects Ollama or GitHub/OpenAI models."""
+    """Provider-neutral wrapper using LiteLLM to select Ollama or GitHub/OpenAI models."""
 
     def chat(self, request: LLMRequest) -> str:
+        """Send a chat request and return the response content.
+
+        Args:
+            request: The LLM request configuration.
+
+        Returns:
+            The response text from the LLM.
+
+        Raises:
+            Exception: If the LLM call fails.
+        """
         logger.info(
-            "llm_request model=%s messages=%d tools=%d callbacks=%d",
+            "llm_request model=%s messages=%d callbacks=%d",
             request.model,
             len(request.messages),
-            len(request.tools or []),
             len(request.callbacks or []),
         )
         try:
@@ -57,20 +70,7 @@ class ModelRequestFactory:
             logger.exception("llm_request_failed model=%s", request.model)
             raise
 
-    def _get_model(self) -> Any:
-        """Return a LangChain chat model backed by LiteLLM.
-
-        Used by ``create_react_agent`` for native tool calling.
-        """
-        from langchain_community.chat_models import ChatLiteLLM
-
-        request = LLMRequest()
-        return ChatLiteLLM(
-            model=request.model,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
-
     @classmethod
-    def from_environment(cls) -> "ModelRequestFactory":
+    def from_environment(cls) -> ModelRequestFactory:
+        """Create a factory configured from environment variables."""
         return cls()

@@ -1,34 +1,52 @@
 """Interactive CLI for the time series construction LangGraph workflow."""
 from __future__ import annotations
 
-import json
 import logging
+import re
 
 try:
-    from .agents_definition import CallbackEvent, CallbackEventType
     from .graph import TimeSeriesConstructionGraph
-except ImportError:
-    from agents_definition import CallbackEvent, CallbackEventType
-    from graph import TimeSeriesConstructionGraph
-try:
     from .logging_config import configure_logging
 except ImportError:
+    from graph import TimeSeriesConstructionGraph
     from logging_config import configure_logging
 
+# Shell/system command patterns to skip
+_SYSTEM_COMMAND_RE = re.compile(
+    r"^(conda|source|activate|deactivate|export|set|unset|alias|unalias|"
+    r"cd\b|pushd|popd|ls\b|dir|echo|printf|clear|exit|quit)\s",
+    re.IGNORECASE,
+)
 
-def display_event(event: CallbackEvent) -> str:
-    payload = event.payload
-    if event.type == CallbackEventType.AWAITING_USER_INPUT:
-        options = payload.get("options", [])
+
+def _is_system_command(value: str) -> bool:
+    if not value.strip():
+        return True
+    if _SYSTEM_COMMAND_RE.match(value):
+        return True
+    tokens = value.strip().split()
+    if len(tokens) == 1:
+        lone = tokens[0].casefold()
+        if lone in {"ai_engineering", "base", "activate", "deactivate"}:
+            return True
+    return False
+
+
+def display_event(event: dict) -> str:
+    t = event.get("type", "")
+    if t == "await":
+        options = event.get("options", [])
         suffix = "\n" + "\n".join(f"  {i}. {option}" for i, option in enumerate(options, 1)) if options else ""
-        return f"[{payload.get('agent', 'System')}] {payload.get('prompt', '')}{suffix}"
-    if event.type == CallbackEventType.AGENT_COMPLETED:
-        result = payload.get("result", {})
-        return f"[{payload.get('agent', 'System')}] {result.get('final_answer', result)}"
-    if event.type == CallbackEventType.ERROR:
-        action = payload.get("user_action")
-        return f"[Error] {payload.get('message', 'Unknown error')}" + (f"\n[Next step] {action}" if action else "")
-    return f"[{event.type.value}] {json.dumps(payload, default=str)}"
+        return f"[{event.get('agent', 'System')}] {event.get('prompt', '')}{suffix}"
+    if t == "final":
+        return f"[{event.get('agent', 'System')}] {event.get('answer', '')}"
+    if t == "intermediate":
+        return f"[{event.get('agent', 'System')}] {event.get('message', '')}"
+    if t == "error":
+        return f"[Error] {event.get('message', 'Unknown error')}"
+    if t == "user_request":
+        return f"[user_request] {event.get('request', '')}"
+    return f"[{t}] {event}"
 
 
 class TimeSeriesCLI:
@@ -38,7 +56,6 @@ class TimeSeriesCLI:
 
     def run(self) -> None:
         print("Time Series Construction (LangGraph) | Human-in-the-loop")
-        print("Environment: ai_engineering (activate this before launching the CLI)")
         print("Describe a ticker and date range, or type 'quit'.")
         while True:
             try:
@@ -48,15 +65,19 @@ class TimeSeriesCLI:
                 return
             if not value:
                 continue
+
+            if _is_system_command(value):
+                logging.getLogger(__name__).info("skipped system command: %s", value)
+                continue
+
             if value.casefold() in {"quit", "exit"}:
-                logging.getLogger(__name__).info("cli_exit_requested")
                 return
-            logging.getLogger(__name__).info("cli_input_received characters=%d waiting=%s", len(value), self.waiting)
+
             events = self.graph.process_user_response(value) if self.waiting else self.graph.process_user_request(value)
             self.waiting = False
             for event in events:
                 print(display_event(event))
-                self.waiting = self.waiting or event.type == CallbackEventType.AWAITING_USER_INPUT
+                self.waiting = self.waiting or event.get("type") == "await"
 
 
 if __name__ == "__main__":
