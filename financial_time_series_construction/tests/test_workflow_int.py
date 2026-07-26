@@ -587,6 +587,73 @@ class TestFullWorkflow:
         errors = [e for e in events if e.type == CallbackEventType.ERROR]
         assert not errors, f"Unexpected error events: {errors}"
 
+    def test_market_data_loads_all_sources_after_source_listing(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """MarketDataAgent should not need one LLM turn per source once the source list is known."""
+        mock_processor.factory.chat_sequence = [
+            # ReferenceDataAgent → resolve APL
+            (
+                "Thought: Look up APL in the instrument catalog.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"APL\"}"
+            ),
+            # ReferenceDataAgent → delegate to MarketDataAgent
+            (
+                "Thought: APL resolved to AAPL. Delegate to MarketDataAgent.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"MarketDataAgent\", "
+                "\"request\": \"load AAPL from 2023-01-01 to 2024-12-31 from all sources\"}"
+            ),
+            # MarketDataAgent → discover sources only once
+            (
+                "Thought: Check available sources.\n"
+                "Action: available_data_sources\n"
+                "Action Input: {}"
+            ),
+            # DataQualityAgent → final answer after deterministic source loading
+            "Final Answer: Quality reviewed for all market sources.",
+            # ReportingAgent → pause for source selection
+            (
+                "Thought: Present the comparison and ask the user to choose a source.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Select a data source for AAPL:\", "
+                "\"options\": [\"yahoo\", \"bloomberg\", \"reuters\"]}"
+            ),
+            # Downstream reporting/gap-filling turns may continue depending on the model
+            "Final Answer: User selected yahoo as the data source for AAPL.",
+            (
+                "Thought: Ask for the gap-filling method.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Select gap method:\", "
+                "\"options\": [\"linear_interpolation\", \"forward_fill\", \"backward_fill\", \"none\"]}"
+            ),
+        ]
+
+        events = mock_processor.process_user_request(
+            "create a time series for APL between 2023 and 2024"
+        )
+
+        completed = [e for e in events if e.type == CallbackEventType.AGENT_COMPLETED]
+        market_events = [e for e in completed if e.payload.get("agent") == "MarketDataAgent"]
+        assert market_events, "Expected MarketDataAgent completion event"
+
+        market_result = market_events[-1].payload.get("result", {})
+        assert sorted(market_result.get("loaded_sources", [])) == ["bloomberg", "reuters", "yahoo"]
+
+        data_quality_events = [
+            event for event in completed
+            if event.payload.get("agent") == "DataQualityAgent"
+        ]
+        assert data_quality_events, "Expected DataQualityAgent completion event"
+        quality_report = data_quality_events[-1].payload.get("result", {}).get("data_quality_report", {})
+        assert quality_report.get("summary", {}).get("source_count") == 3
+
+        errors = [e for e in events if e.type == CallbackEventType.ERROR]
+        assert not errors, f"Unexpected error events: {errors}"
+
     def test_workflow_resume_completes_reporting_agent(self, mock_data_dir: Path, mock_processor: TimeSeriesConstructionProcessor) -> None:
         """After the user selects a source, ``process_user_response`` resumes the
         ReportingAgent which completes with a Final Answer."""

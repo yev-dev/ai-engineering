@@ -1,7 +1,22 @@
 """Reusable prompt builders for adaptive time-series agents."""
 from __future__ import annotations
 
+import os
+
 from financial_time_series_construction.agents_definition import Agent
+
+# Detect model family from environment to adjust prompt style.
+# Larger/creative models need more explicit formatting constraints;
+# smaller models benefit from concise instructions.
+_LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("LLM_OLLAMA_MODEL", "")).casefold()
+_IS_LARGE_MODEL = any(
+    tag in _LLM_MODEL
+    for tag in ("deepseek", "qwen2.5:7", "qwen2.5:14", "qwen2.5:32", "qwen2.5:72", "llama3", "gpt-4", "gemma")
+)
+_IS_SMALL_MODEL = any(
+    tag in _LLM_MODEL
+    for tag in ("1.5b", "1b", "3b", "tiny", "small")
+)
 
 REACT_PROTOCOL = """Use this protocol structure:
 Thought: <brief decision rationale>
@@ -17,6 +32,26 @@ Select actions adaptively from the current request context; do not force a rigid
 when enough information is already available.
 """
 
+# For larger/creative models, add explicit formatting constraints to prevent
+# narrative output that doesn't follow the ReAct format.
+_REACT_PROTOCOL_STRICT = """You MUST follow this exact protocol structure with no extra text:
+
+Thought: <brief decision rationale>
+Action: <one tool name>
+Action Input: <valid JSON object>
+
+After a tool result, continue the protocol. When complete, use:
+Final Answer: <concise user-facing result>
+
+CRITICAL RULES:
+- Every response MUST contain either an Action/Action Input block OR a Final Answer.
+- Do NOT describe what you will do - just do it.
+- Do NOT use markdown code fences around Action Input JSON.
+- Do NOT add conversational text before or after the protocol.
+- Never invent tool results. If a tool reports an error, explain it to the user
+  and stop or ask for the missing information.
+"""
+
 DELEGATION_EXAMPLE = """For most initial requests, the Orchestrator should delegate using:
 Action: delegate_to_agent
 Action Input: {"agent_name": "ReferenceDataAgent", "request": "<original user request>"}
@@ -28,6 +63,9 @@ clarification steps.
 def agent_system_prompt(agent: Agent) -> str:
     """Build the full system prompt for an agent including goal, tools, and guardrails.
 
+    Selects a stricter ReAct protocol for larger/creative models that tend to
+    produce narrative output instead of structured tool calls.
+
     Args:
         agent: The agent definition.
 
@@ -37,10 +75,17 @@ def agent_system_prompt(agent: Agent) -> str:
     tools = ", ".join(agent.tools) or "none"
     goal = agent.goal or agent.description
     guardrails = "\n".join(f"- {rule}" for rule in agent.guardrails) or "- Use only the registered tools."
+
+    # Select protocol variant based on model size
+    if _IS_LARGE_MODEL and not _IS_SMALL_MODEL:
+        protocol = _REACT_PROTOCOL_STRICT
+    else:
+        protocol = REACT_PROTOCOL
+
     return (
         f"{agent.system_prompt}\n\nGoal:\n{goal}\n\n"
         f"Available tools: {tools}\nGuardrails:\n{guardrails}\n\n"
-        f"{DELEGATION_EXAMPLE if agent.name == 'Orchestrator' else ''}{REACT_PROTOCOL}"
+        f"{DELEGATION_EXAMPLE if agent.name == 'Orchestrator' else ''}{protocol}"
     )
 
 

@@ -110,7 +110,9 @@ AGENT_REGISTRY: dict[str, Agent] = {
         description="Retrieves historical data from relevant available sources based on request context.",
         system_prompt=(
             _REACT_COMMON
-            + " List sources, load each source, then delegate to DataQualityAgent. Use "
+            + " Use available_data_sources once to discover the source list, then let the workflow "
+            "retrieve all listed sources in one pass before delegating to DataQualityAgent. Do not "
+            "ask the user to pick a single source or narrate a source-by-source plan. Use "
             "historical_prices with normalized yyyy-mm-dd dates after interpreting user date text."
         ),
         tools=[

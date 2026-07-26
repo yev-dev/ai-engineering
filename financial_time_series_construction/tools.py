@@ -1,6 +1,7 @@
 """Deterministic domain tools exposed to ReAct agents via langchain annotations."""
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import re

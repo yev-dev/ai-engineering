@@ -224,7 +224,11 @@ def _print_events(events: list[Any]) -> None:
                 print(f"Options: {', '.join(options)}")
         elif event_type == CallbackEventType.AGENT_COMPLETED.value:
             result = event.payload.get("result", {})
-            if isinstance(result, dict) and result.get("data_quality_report"):
+            if (
+                agent == "DataQualityAgent"
+                and isinstance(result, dict)
+                and result.get("data_quality_report")
+            ):
                 print(f"\n[COMPLETE] Agent: {agent}")
                 _print_data_quality_report(result["data_quality_report"])
             elif isinstance(result, dict) and "final_answer" in result:
