@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from financial_time_series_construction.agents_definition import CallbackEventType
 from financial_time_series_construction.models import ModelRequestFactory
 from financial_time_series_construction.prompt_library import (
@@ -61,7 +63,10 @@ def _print_data_quality_report(report: dict[str, Any]) -> None:
         table.add_column("Source", style="cyan")
         table.add_column("Symbol", style="green")
         table.add_column("Completeness %", justify="right")
+        table.add_column("Available", justify="right")
         table.add_column("Missing", justify="right")
+        table.add_column("Min Date")
+        table.add_column("Max Date")
         table.add_column("Duplicates", justify="right")
         table.add_column("Issues")
         for row in rows:
@@ -70,18 +75,23 @@ def _print_data_quality_report(report: dict[str, Any]) -> None:
                 str(row.get("source", "")),
                 str(row.get("symbol", "")),
                 str(row.get("completeness_pct", "n/a")),
+                str(row.get("available_record_count", "n/a")),
                 str(row.get("missing_count", "n/a")),
+                str(row.get("min_date") or "n/a"),
+                str(row.get("max_date") or "n/a"),
                 str(row.get("duplicate_count", "n/a")),
                 ", ".join(str(item) for item in issues) if issues else "none",
             )
         console.print(table)
     else:
-        print("Source | Symbol | Completeness % | Missing | Duplicates | Issues")
+        print("Source | Symbol | Completeness % | Available | Missing | Min Date | Max Date | Duplicates | Issues")
         for row in rows:
             issues = row.get("issues") or []
             print(
                 f"{row.get('source', '')} | {row.get('symbol', '')} | "
-                f"{row.get('completeness_pct', 'n/a')} | {row.get('missing_count', 'n/a')} | "
+                f"{row.get('completeness_pct', 'n/a')} | {row.get('available_record_count', 'n/a')} | "
+                f"{row.get('missing_count', 'n/a')} | {row.get('min_date') or 'n/a'} | "
+                f"{row.get('max_date') or 'n/a'} | "
                 f"{row.get('duplicate_count', 'n/a')} | "
                 f"{', '.join(str(item) for item in issues) if issues else 'none'}"
             )
@@ -89,13 +99,55 @@ def _print_data_quality_report(report: dict[str, Any]) -> None:
     best_source = summary.get("best_source_by_completeness")
     avg_completeness = summary.get("average_completeness_pct")
     total_missing = summary.get("total_missing_count")
+    total_available = summary.get("total_available_records")
+    min_date = summary.get("min_date")
+    max_date = summary.get("max_date")
     print(
         "Summary: "
         f"sources={summary.get('source_count', len(rows))}, "
         f"best_source={best_source or 'n/a'}, "
+        f"available_records={total_available if total_available is not None else 'n/a'}, "
+        f"date_range={min_date or 'n/a'}..{max_date or 'n/a'}, "
         f"avg_completeness={avg_completeness if avg_completeness is not None else 'n/a'}, "
         f"total_missing={total_missing if total_missing is not None else 'n/a'}"
     )
+
+
+def _save_data_quality_summary_csv(events: list[Any], run_dir: Path) -> Path | None:
+    """Persist latest data quality summary rows as CSV if present in events."""
+    latest_report: dict[str, Any] | None = None
+    for event in events:
+        if event.type.value != CallbackEventType.AGENT_COMPLETED.value:
+            continue
+        result = event.payload.get("result", {})
+        if isinstance(result, dict) and isinstance(result.get("data_quality_report"), dict):
+            latest_report = result["data_quality_report"]
+
+    if not latest_report:
+        return None
+
+    rows = latest_report.get("rows", []) or []
+    summary = latest_report.get("summary", {}) or {}
+    if not rows:
+        return None
+
+    flattened_rows: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        issues = item.get("issues")
+        if isinstance(issues, list):
+            item["issues"] = ";".join(str(value) for value in issues)
+        item["summary_total_available_records"] = summary.get("total_available_records")
+        item["summary_total_missing_count"] = summary.get("total_missing_count")
+        item["summary_min_date"] = summary.get("min_date")
+        item["summary_max_date"] = summary.get("max_date")
+        item["summary_best_source_by_completeness"] = summary.get("best_source_by_completeness")
+        item["summary_average_completeness_pct"] = summary.get("average_completeness_pct")
+        flattened_rows.append(item)
+
+    output_path = run_dir / "data_quality_summary.csv"
+    pd.DataFrame(flattened_rows).to_csv(output_path, index=False)
+    return output_path
 
 
 def _save_artifacts(
@@ -152,6 +204,10 @@ def _save_artifacts(
     report_text_path = run_dir / "workflow_report.txt"
     report_text_path.write_text(format_workflow_report(workflow_report))
     logger.info("Workflow report text saved to %s", report_text_path)
+
+    quality_csv_path = _save_data_quality_summary_csv(events, run_dir)
+    if quality_csv_path is not None:
+        logger.info("Data quality summary CSV saved to %s", quality_csv_path)
 
 
 def _print_events(events: list[Any]) -> None:
@@ -245,6 +301,11 @@ def main() -> None:
         help="Enable debug logging",
     )
     parser.add_argument(
+        "--debug-flow",
+        action="store_true",
+        help="Enable one-line processor/tool flow diagnostics.",
+    )
+    parser.add_argument(
         "--provider",
         choices=["ollama", "github", "deepseek"],
         help="LLM provider override for this run.",
@@ -267,7 +328,7 @@ def main() -> None:
     parser.add_argument(
         "--framework",
         choices=["langgraph", "autogen"],
-        default=os.getenv("AGENTIC_FRAMEWORK", "langgraph"),
+        default=os.getenv("AGENTIC_FRAMEWORK", "autogen"),
         help="Agentic framework runtime to use.",
     )
     parser.add_argument(
@@ -288,6 +349,8 @@ def main() -> None:
         os.environ["LLM_TEMPERATURE"] = str(args.temperature)
     if args.max_tokens is not None:
         os.environ["LLM_MAX_TOKENS"] = str(args.max_tokens)
+    if args.debug_flow:
+        os.environ["TSC_DEBUG_FLOW"] = "1"
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -307,6 +370,8 @@ def main() -> None:
     print(f"Framework: {args.framework}")
     print(f"Provider: {config['provider']}")
     print(f"Model: {config['model']}")
+    if os.getenv("TSC_DEBUG_FLOW"):
+        print("Debug flow: enabled (TSC_DEBUG_FLOW=1)")
     print(f"{'='*60}\n")
 
     if args.request:

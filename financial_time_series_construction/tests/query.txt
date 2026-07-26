@@ -41,3 +41,11 @@ ollama/deepseek-v2:16b
 
 LLM_MODEL="ollama/deepseek-v2:16b" python -m financial_time_series_construction.cli \
   --request "AAPL from 2023-01-01 to 2024-01-01"
+
+
+
+  Command executed:
+/opt/homebrew/anaconda3/envs/ai_engineering/bin/python -m pytest -q test_workflow_int.py -k "gapfilling_method_resume_auto_continues_to_construction or gapfilling_selected_method_does_not_repause or gapfilling_final_answer_with_method_still_continues_to_construction or quality_includes_available_and_date_range" test_cli_quality_render.py
+
+
+python -m financial_time_series_construction.cli --request "create time series Apple (AAPL) from 2024-01-02 to 2025-01-02" --provider ollama --model qwen2.5:1.5b --debug-flow

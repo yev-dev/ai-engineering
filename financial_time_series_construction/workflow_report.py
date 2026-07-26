@@ -53,6 +53,9 @@ def build_workflow_report(
         - required_completed_agents: list[str]
         - required_delegations: list[{'from': str, 'to': str}] or list[[from, to]]
         - min_llm_delegations: int
+        - min_available_market_sources: int
+        - max_unavailable_market_sources: int
+        - required_unavailable_market_sources_logged: bool
     """
     records = [_event_to_dict(event) for event in events]
 
@@ -60,6 +63,7 @@ def build_workflow_report(
     paused_agents: list[str] = []
     errors: list[dict[str, Any]] = []
     delegations: list[dict[str, Any]] = []
+    unavailable_market_sources: list[dict[str, str]] = []
 
     for record in records:
         event_type = record.get("type", "")
@@ -75,6 +79,13 @@ def build_workflow_report(
                 paused_agents.append(agent_name)
         elif event_type == "error":
             errors.append(payload)
+            for item in payload.get("unavailable_sources", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get("source", "")).strip().casefold()
+                reason = str(item.get("reason", item.get("error", ""))).strip()
+                if source:
+                    unavailable_market_sources.append({"source": source, "reason": reason})
         elif event_type == "delegated":
             delegations.append(
                 {
@@ -84,6 +95,36 @@ def build_workflow_report(
                     "routing_reason": str(payload.get("routing_reason", "")).strip(),
                 }
             )
+        if event_type == "agent_completed" and str(payload.get("agent", "")).strip() == "MarketDataAgent":
+            result = payload.get("result", {}) or {}
+            for item in result.get("unavailable_sources", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get("source", "")).strip().casefold()
+                reason = str(item.get("reason", item.get("error", ""))).strip()
+                if source:
+                    unavailable_market_sources.append({"source": source, "reason": reason})
+
+    unavailable_unique: list[dict[str, str]] = []
+    seen_unavailable: set[tuple[str, str]] = set()
+    for item in unavailable_market_sources:
+        key = (item.get("source", ""), item.get("reason", ""))
+        if not key[0] or key in seen_unavailable:
+            continue
+        seen_unavailable.add(key)
+        unavailable_unique.append({"source": key[0], "reason": key[1]})
+
+    loaded_market_sources: set[str] = set()
+    for item in delegations:
+        if item.get("from_agent") == "MarketDataAgent" and item.get("to_agent") == "DataQualityAgent":
+            # Source-level availability is carried by events; loaded-source count is inferred
+            # as known source universe minus explicitly unavailable set.
+            loaded_market_sources = {"yahoo", "bloomberg", "reuters"}
+            break
+
+    unavailable_names = {item["source"] for item in unavailable_unique}
+    if loaded_market_sources:
+        loaded_market_sources = loaded_market_sources.difference(unavailable_names)
 
     completed_unique = list(dict.fromkeys(completed_agents))
     paused_unique = list(dict.fromkeys(paused_agents))
@@ -115,6 +156,9 @@ def build_workflow_report(
             "delegation_edges_order": delegation_edges,
             "delegation_edges_unique": delegation_edge_unique,
             "error_count": len(errors),
+            "unavailable_market_sources": unavailable_unique,
+            "unavailable_market_source_count": len(unavailable_unique),
+            "available_market_source_count": len(loaded_market_sources) if loaded_market_sources else None,
         },
         "routing": {
             "by_mode": dict(routing_modes),
@@ -141,6 +185,11 @@ def build_workflow_report(
         )
     if len(errors) > 0:
         report["warnings"].append("Workflow emitted one or more error events.")
+    if unavailable_unique:
+        listed = ", ".join(item["source"] for item in unavailable_unique)
+        report["warnings"].append(
+            f"Market data unavailable for one or more sources: {listed}."
+        )
 
     if validation_rules:
         checks: dict[str, Any] = {}
@@ -177,6 +226,21 @@ def build_workflow_report(
         if "min_llm_delegations" in validation_rules:
             min_llm = int(validation_rules.get("min_llm_delegations", 0))
             checks["min_llm_delegations"] = llm_delegations >= min_llm
+
+        if "min_available_market_sources" in validation_rules:
+            min_available = int(validation_rules.get("min_available_market_sources", 0))
+            available_count = len(loaded_market_sources) if loaded_market_sources else 0
+            checks["min_available_market_sources"] = available_count >= min_available
+
+        if "max_unavailable_market_sources" in validation_rules:
+            max_unavailable = int(validation_rules.get("max_unavailable_market_sources", 0))
+            checks["max_unavailable_market_sources"] = len(unavailable_unique) <= max_unavailable
+
+        if "required_unavailable_market_sources_logged" in validation_rules:
+            required_logged = bool(validation_rules.get("required_unavailable_market_sources_logged"))
+            checks["required_unavailable_market_sources_logged"] = (
+                (len(unavailable_unique) > 0) if required_logged else True
+            )
 
         report["validation"]["checks"] = checks
         report["validation"]["passed"] = all(checks.values()) if checks else True

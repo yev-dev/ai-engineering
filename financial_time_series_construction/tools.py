@@ -22,6 +22,21 @@ SOURCES = ("yahoo", "bloomberg", "reuters")
 logger = logging.getLogger(__name__)
 
 
+def _debug_flow_enabled() -> bool:
+    """Return True when lightweight flow debugging is enabled."""
+    return str(os.getenv("TSC_DEBUG_FLOW", "")).strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _debug_tool_event(tool: str, phase: str, **kwargs: Any) -> None:
+    """Emit one-line debug flow events for tool-level tracing."""
+    if not _debug_flow_enabled():
+        return
+    details = " ".join(f"{key}={value}" for key, value in kwargs.items())
+    logger.info("debug_flow component=tool tool=%s phase=%s %s", tool, phase, details)
+
+
 def _log_tool_progress(tool_name: str, phase: str, **kwargs: Any) -> None:
     """Emit structured tool progress logs for workflow diagnostics."""
     details = " ".join(f"{key}={value}" for key, value in kwargs.items())
@@ -248,6 +263,7 @@ def get_instrument_details(
         A dict with 'found' boolean and instrument details if resolved.
     """
     value_input = query or symbol or ""
+    _debug_tool_event("get_instrument_details", "start", query=value_input, identifier=identifier)
     logger.info("tool_get_instrument_details query=%s identifier=%s", value_input, identifier)
     frame = pd.read_csv(DATA_DIR / "instruments.csv")
     value = value_input.strip().casefold()
@@ -271,6 +287,7 @@ def get_instrument_details(
                     token,
                     record.get("symbol"),
                 )
+                _debug_tool_event("get_instrument_details", "resolved", mode="token", symbol=record.get("symbol"))
                 return {"found": True, "query": value_input, **record}
 
     # If query includes company-name fragments, match on meaningful word tokens.
@@ -314,6 +331,7 @@ def get_instrument_details(
                 record.get("security_name"),
                 sorted(query_tokens),
             )
+            _debug_tool_event("get_instrument_details", "resolved", mode="name_tokens", symbol=record.get("symbol"))
             return {"found": True, "query": value_input, **record}
 
     ticker_candidate = (
@@ -345,12 +363,14 @@ def get_instrument_details(
         message = "Instrument was not found."
         if suggestions:
             message += f" Did you mean: {', '.join(suggestions)}?"
+        _debug_tool_event("get_instrument_details", "not_found", query=value_input)
         return {"found": False, "query": value_input, "suggestions": suggestions, "message": message}
     record = matches.iloc[0].to_dict()
     logger.info(
         "instrument_resolved query=%s symbol=%s security_name=%s",
         value_input, record.get("symbol"), record.get("security_name"),
     )
+    _debug_tool_event("get_instrument_details", "resolved", mode="direct", symbol=record.get("symbol"))
     return {"found": True, "query": value_input, **record}
 
 
@@ -376,6 +396,7 @@ def historical_prices(symbol: str, start_date: str, end_date: str, source: str) 
         "tool_historical_prices_start symbol=%s source=%s start=%s end=%s",
         symbol, source, start_date, end_date,
     )
+    _debug_tool_event("historical_prices", "start", symbol=symbol, source=source, start=start_date, end=end_date)
     source = source.casefold()
     if source not in SOURCES:
         raise ValueError(f"Unsupported source: {source}")
@@ -386,13 +407,50 @@ def historical_prices(symbol: str, start_date: str, end_date: str, source: str) 
     series = pd.to_numeric(frame[symbol], errors="coerce").sort_index()
     series = series.loc[pd.Timestamp(normalized_start):pd.Timestamp(normalized_end)]
     if series.empty:
-        raise ValueError(
-            f"No historical data is available for {symbol} from {normalized_start} to {normalized_end} in {source}."
+        full_series = pd.to_numeric(frame[symbol], errors="coerce").sort_index()
+        if full_series.empty:
+            raise ValueError(
+                f"No historical data is available for {symbol} from {normalized_start} to {normalized_end} in {source}."
+            )
+
+        requested_start = pd.Timestamp(normalized_start)
+        requested_end = pd.Timestamp(normalized_end)
+        index = full_series.index
+
+        # Snap to the closest available dates when the requested window has no rows
+        # (for example, weekends/holidays or out-of-range boundaries).
+        left = max(0, min(index.searchsorted(requested_start, side="left"), len(index) - 1))
+        right = max(0, min(index.searchsorted(requested_end, side="right") - 1, len(index) - 1))
+        if right < left:
+            if left >= len(index):
+                left = len(index) - 1
+            right = left
+
+        series = full_series.iloc[left : right + 1]
+        logger.warning(
+            "tool_historical_prices_fallback_closest_dates symbol=%s source=%s requested_start=%s requested_end=%s actual_start=%s actual_end=%s observations=%d",
+            symbol,
+            source,
+            normalized_start,
+            normalized_end,
+            series.index.min().strftime("%Y-%m-%d") if not series.empty else None,
+            series.index.max().strftime("%Y-%m-%d") if not series.empty else None,
+            len(series),
+        )
+        _debug_tool_event(
+            "historical_prices",
+            "fallback_closest_dates",
+            symbol=symbol,
+            source=source,
+            actual_start=series.index.min().strftime("%Y-%m-%d") if not series.empty else None,
+            actual_end=series.index.max().strftime("%Y-%m-%d") if not series.empty else None,
+            observations=len(series),
         )
     logger.info(
         "tool_historical_prices_completed symbol=%s source=%s observations=%d missing=%d",
         symbol, source, len(series), int(series.isna().sum()),
     )
+    _debug_tool_event("historical_prices", "completed", symbol=symbol, source=source, observations=len(series))
     return {
         "symbol": symbol,
         "source": source,
@@ -403,6 +461,7 @@ def historical_prices(symbol: str, start_date: str, end_date: str, source: str) 
 
 def check_data_quality(
     prices: list[Any] | None = None,
+    dates: list[str] | None = None,
     source: str | None = None,
     symbol: str | None = None,
     data: dict[str, Any] | None = None,
@@ -431,6 +490,7 @@ def check_data_quality(
     # Support passing the full historical_prices result dict as a single argument
     if data is not None:
         prices = data.get("prices", prices)
+        dates = data.get("dates", dates)
         source = data.get("source", source)
         symbol = data.get("symbol", symbol)
 
@@ -444,6 +504,7 @@ def check_data_quality(
                 source=source,
             )
             prices = hp_result.get("prices")
+            dates = hp_result.get("dates", dates)
             logger.info(
                 "tool_check_data_quality_auto_fetched symbol=%s source=%s observations=%d",
                 symbol, source, len(prices) if prices else 0,
@@ -463,9 +524,24 @@ def check_data_quality(
         "tool_check_data_quality_start symbol=%s source=%s observations=%d",
         symbol, source, len(prices),
     )
+    _debug_tool_event("check_data_quality", "start", symbol=symbol, source=source, observations=len(prices))
     values = pd.Series(prices, dtype="float64")
+    if dates is not None and len(dates) == len(values):
+        date_index = pd.to_datetime(pd.Series(dates, dtype="string"), errors="coerce")
+    else:
+        date_index = pd.Series([pd.NaT] * len(values), dtype="datetime64[ns]")
     missing = int(values.isna().sum())
+    available = int(values.notna().sum())
     non_positive = int((values.dropna() <= 0).sum())
+    min_value = float(values.min(skipna=True)) if available else None
+    max_value = float(values.max(skipna=True)) if available else None
+
+    # Use date index only where a price observation exists.
+    observed_dates = date_index[values.notna()] if len(date_index) == len(values) else pd.Series(dtype="datetime64[ns]")
+    observed_dates = observed_dates.dropna()
+    min_date = observed_dates.min().strftime("%Y-%m-%d") if not observed_dates.empty else None
+    max_date = observed_dates.max().strftime("%Y-%m-%d") if not observed_dates.empty else None
+
     issues = []
     if missing:
         issues.append("missing_or_nan_values")
@@ -475,15 +551,28 @@ def check_data_quality(
         "source": source,
         "symbol": symbol,
         "total_values": len(values),
+        "available_record_count": available,
         "missing_count": missing,
         "nan_count": missing,
         "completeness_pct": round((1 - missing / len(values)) * 100, 2) if len(values) else 0.0,
+        "min_value": min_value,
+        "max_value": max_value,
+        "min_date": min_date,
+        "max_date": max_date,
         "duplicate_count": 0,
         "issues": issues,
     }
     logger.info(
         "tool_check_data_quality_completed symbol=%s source=%s missing=%d issues=%d",
         symbol, source, missing, len(issues),
+    )
+    _debug_tool_event(
+        "check_data_quality",
+        "completed",
+        symbol=symbol,
+        source=source,
+        available=available,
+        missing=missing,
     )
     return result
 
@@ -523,9 +612,12 @@ def apply_gap_filling(
         Dict with filled prices, dates, and method metadata.
     """
     logger.info("tool_gap_filling_start symbol=%s method=%s", prices.get("symbol"), method)
-    normalized_dates = [parse_flexible_date(str(value), "start").strftime("%Y-%m-%d") for value in (dates or prices["dates"])]
+    _debug_tool_event("apply_gap_filling", "start", symbol=prices.get("symbol"), method=method)
+    source_dates = [str(value) for value in (dates or prices["dates"])]
+    normalized_dates = [parse_flexible_date(value, "start").strftime("%Y-%m-%d") for value in source_dates]
+    original_prices = list(prices["prices"])
     series = pd.Series(
-        prices["prices"],
+        original_prices,
         index=pd.to_datetime(normalized_dates),
         dtype="float64",
     )
@@ -541,7 +633,12 @@ def apply_gap_filling(
         raise ValueError(f"Unsupported gap method: {method}")
     result = {
         "symbol": prices["symbol"],
+        "source": prices.get("source"),
         "method": method,
+        "original_dates": source_dates,
+        "original_prices": original_prices,
+        "filled_dates": [d.strftime("%Y-%m-%d") for d in filled.index],
+        "filled_prices": [None if pd.isna(value) else float(value) for value in filled],
         "dates": [d.strftime("%Y-%m-%d") for d in filled.index],
         "prices": [None if pd.isna(value) else float(value) for value in filled],
     }
@@ -549,6 +646,7 @@ def apply_gap_filling(
         "tool_gap_filling_completed symbol=%s method=%s observations=%d remaining_missing=%d",
         prices.get("symbol"), method, len(filled), int(filled.isna().sum()),
     )
+    _debug_tool_event("apply_gap_filling", "completed", symbol=prices.get("symbol"), method=method, observations=len(filled))
     return result
 
 
@@ -567,10 +665,22 @@ def build_timeseries(
     Returns:
         Path to the saved CSV file.
     """
-    logger.info("tool_build_timeseries_start symbol=%s filename=%s", series.get("symbol"), filename)
+    output_dates = series.get("filled_dates") or series.get("dates") or []
+    output_prices = series.get("filled_prices") or series.get("prices") or []
+    logger.info("tool_build_timeseries_start symbol=%s filename=%s prices_length=%d", series.get("symbol"), filename, len(output_prices))
+    _debug_tool_event("build_timeseries", "start", symbol=series.get("symbol"), filename=filename, run_id=run_id)
     output = _run_dir(run_id) / filename
-    pd.DataFrame({"date": series["dates"], "price": series["prices"]}).to_csv(output, index=False)
+    frame_data: dict[str, Any] = {
+        "date": output_dates,
+        "price": output_prices,
+    }
+    if series.get("source"):
+        frame_data["source"] = [series.get("source")] * len(output_dates)
+    if series.get("method"):
+        frame_data["gap_filling_method"] = [series.get("method")] * len(output_dates)
+    pd.DataFrame(frame_data).to_csv(output, index=False)
     logger.info("tool_build_timeseries_completed path=%s", output)
+    _debug_tool_event("build_timeseries", "completed", path=output)
     return str(output)
 
 
@@ -613,11 +723,58 @@ def visualize_timeseries(
     """
     logger.info("tool_visualize_timeseries_start symbol=%s title=%s", prices.get("symbol"), title)
     output = _run_dir(run_id) / "timeseries.png"
-    frame = pd.DataFrame({"date": pd.to_datetime(prices["dates"]), "price": prices["prices"]})
+    filled_dates = prices.get("filled_dates") or prices.get("dates") or []
+    filled_prices = prices.get("filled_prices") or prices.get("prices") or []
+    filled_frame = pd.DataFrame({
+        "date": pd.to_datetime(filled_dates),
+        "price": pd.to_numeric(pd.Series(filled_prices), errors="coerce"),
+    })
+    original_frame: pd.DataFrame | None = None
+    if prices.get("original_dates") and prices.get("original_prices"):
+        original_frame = pd.DataFrame({
+            "date": pd.to_datetime(prices["original_dates"]),
+            "price": pd.to_numeric(pd.Series(prices["original_prices"]), errors="coerce"),
+        })
     sns.set_theme(style="whitegrid")
     figure, axis = plt.subplots(figsize=(11, 5))
-    sns.lineplot(data=frame, x="date", y="price", ax=axis)
+    if original_frame is not None:
+        axis.plot(
+            original_frame["date"],
+            original_frame["price"],
+            label="Before gap filling",
+            color="0.7",
+            linestyle="--",
+            linewidth=1.4,
+            alpha=0.95,
+        )
+    axis.plot(
+        filled_frame["date"],
+        filled_frame["price"],
+        label="After gap filling",
+        color="tab:blue",
+        linewidth=2.0,
+    )
+    if original_frame is not None:
+        aligned = filled_frame.merge(
+            original_frame.rename(columns={"price": "original_price"}),
+            on="date",
+            how="left",
+        )
+        gap_mask = aligned["original_price"].isna() & aligned["price"].notna()
+        if gap_mask.any():
+            axis.scatter(
+                aligned.loc[gap_mask, "date"],
+                aligned.loc[gap_mask, "price"],
+                label="Gap filled",
+                color="tab:orange",
+                s=28,
+                zorder=4,
+            )
     axis.set_title(title)
+    axis.set_xlabel("Date")
+    axis.set_ylabel("Price")
+    if original_frame is not None:
+        axis.legend()
     figure.tight_layout()
     figure.savefig(output, dpi=140)
     plt.close(figure)

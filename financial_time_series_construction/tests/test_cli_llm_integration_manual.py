@@ -37,8 +37,8 @@ def test_cli_real_llm_two_human_checkpoints(tmp_path: Path) -> None:
 
     # Provide deterministic responses for the two expected prompts.
     # First line: selected source.
-    # Second line: selected gap-filling method.
-    user_input = "yahoo\nlinear_interpolation\n"
+    # Second line: selected gap-filling method via quick-option number.
+    user_input = "yahoo\n1\n"
 
     process = subprocess.run(
         [
@@ -81,6 +81,16 @@ def test_cli_real_llm_two_human_checkpoints(tmp_path: Path) -> None:
     edges = [tuple(item) for item in summary.get("delegation_edges_unique", [])]
     assert ("DataQualityAgent", "ReportingAgent") in edges
     assert ("ReportingAgent", "GapFillingAgent") in edges
+    assert ("GapFillingAgent", "TimeSeriesConstructionAgent") in edges
+    assert ("TimeSeriesConstructionAgent", "ReportingAgent") in edges
+
+    completed = summary.get("completed_agents_unique", [])
+    assert "TimeSeriesConstructionAgent" in completed
+    assert "ReportingAgent" in completed
+
+    # Availability metadata should always be present for validation/reporting.
+    assert "unavailable_market_source_count" in summary
+    assert "unavailable_market_sources" in summary
 
     # Keep no-error guarantee for this verification run.
     assert summary.get("error_count", 1) == 0

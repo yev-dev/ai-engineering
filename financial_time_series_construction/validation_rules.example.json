@@ -9,13 +9,16 @@
     "MarketDataAgent",
     "DataQualityAgent",
     "ReportingAgent",
-    "GapFillingAgent"
+    "GapFillingAgent",
+    "TimeSeriesConstructionAgent"
   ],
   "required_delegations": [
     {"from": "ReferenceDataAgent", "to": "MarketDataAgent"},
     {"from": "MarketDataAgent", "to": "DataQualityAgent"},
     {"from": "DataQualityAgent", "to": "ReportingAgent"},
-    {"from": "ReportingAgent", "to": "GapFillingAgent"}
+    {"from": "ReportingAgent", "to": "GapFillingAgent"},
+    {"from": "GapFillingAgent", "to": "TimeSeriesConstructionAgent"},
+    {"from": "TimeSeriesConstructionAgent", "to": "ReportingAgent"}
   ],
   "min_llm_delegations": 0
 }

@@ -96,7 +96,8 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "LOG_LEVEL": "INFO"
+                "LOG_LEVEL": "INFO",
+                "LLM_MODEL": "ollama/qwen2.5:1.5b"
             }
         },
         {

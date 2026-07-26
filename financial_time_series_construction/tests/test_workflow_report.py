@@ -71,3 +71,47 @@ def test_workflow_report_rule_validation_is_runtime_configurable() -> None:
     assert checks["required_completed:DataQualityAgent"] is True
     assert checks["required_delegation:MarketDataAgent->DataQualityAgent"] is True
     assert checks["min_llm_delegations"] is True
+
+
+def test_workflow_report_tracks_unavailable_market_sources_and_validates() -> None:
+    events = [
+        {
+            "type": "agent_completed",
+            "payload": {
+                "agent": "MarketDataAgent",
+                "result": {
+                    "delegated_to": "DataQualityAgent",
+                    "loaded_sources": ["yahoo", "reuters"],
+                    "unavailable_sources": [
+                        {"source": "bloomberg", "reason": "No historical data for requested date range."}
+                    ],
+                },
+            },
+        },
+        {
+            "type": "delegated",
+            "payload": {
+                "from_agent": "MarketDataAgent",
+                "to_agent": "DataQualityAgent",
+                "routing_mode": "deterministic",
+            },
+        },
+    ]
+
+    rules = {
+        "min_available_market_sources": 2,
+        "max_unavailable_market_sources": 1,
+        "required_unavailable_market_sources_logged": True,
+    }
+
+    report = build_workflow_report(events, validation_rules=rules)
+
+    summary = report["summary"]
+    assert summary["unavailable_market_source_count"] == 1
+    assert summary["available_market_source_count"] == 2
+    assert summary["unavailable_market_sources"][0]["source"] == "bloomberg"
+
+    checks = report["validation"]["checks"]
+    assert checks["min_available_market_sources"] is True
+    assert checks["max_unavailable_market_sources"] is True
+    assert checks["required_unavailable_market_sources_logged"] is True

@@ -44,12 +44,17 @@ _MARKETDATA_ALL_SOURCES_NOTE = (
 
 _REFERENCE_EXECUTE_NOTE = (
     "[SYSTEM_NOTE] EXECUTE_TOOL_NOW: You must call get_instrument_details with the resolved "
-    "query parameter. Do not describe what you will do — call the tool now and return the actual result."
+    "query parameter. Do not describe what you will do - call the tool now and return the actual result."
+)
+
+_REPORTING_FINAL_SUMMARY_NOTE = (
+    "[SYSTEM_NOTE] FINAL_SUMMARY_ONLY: When TimeSeriesConstructionAgent is ready to hand off "
+    "to ReportingAgent, keep the request focused on summarizing the completed artifacts."
 )
 
 
 class TimeSeriesConstructionProcessor:
-    """Main processor that orchestrates the ReACT agent workflow.
+    """Main processor that orchestrates the ReACT workflow.
 
     Manages the LLM-driven ReACT loop with delegation, human-in-the-loop
     pauses, and callback event emission.
@@ -64,6 +69,24 @@ class TimeSeriesConstructionProcessor:
         self.handler = handler or TimeSeriesConstructionHandler()
         self.pending_events: list[CallbackEvent] = []
         logger.info("processor_initialized session_id=%s", self.handler.session_id)
+
+    def _debug_flow_event(
+        self,
+        component: str,
+        stage: str,
+        agent: str | None = None,
+        iteration: int | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Emit a structured workflow flow event for debug tracing."""
+        parts = [f"component={component}", f"stage={stage}"]
+        if agent is not None:
+            parts.append(f"agent={agent}")
+        if iteration is not None:
+            parts.append(f"iteration={iteration}")
+        if detail:
+            parts.append(f"detail={detail}")
+        logger.debug("flow_event %s", " ".join(parts))
 
     def process_user_request(self, user_input: str) -> list[CallbackEvent]:
         """Process an initial user request through the workflow.
@@ -232,11 +255,12 @@ class TimeSeriesConstructionProcessor:
     @staticmethod
     def _extract_original_request_from_messages(messages: list[dict[str, str]]) -> str:
         """Extract the original user request from enriched agent messages."""
-        all_user_text = " ".join(
+        user_texts = [
             msg.get("content", "")
             for msg in messages
             if msg.get("role") == "user"
-        ).strip()
+        ]
+        all_user_text = " ".join(user_texts).strip()
         original_match = re.search(r"original_request=(.+)", all_user_text)
         return original_match.group(1).strip() if original_match else all_user_text
 
@@ -245,15 +269,19 @@ class TimeSeriesConstructionProcessor:
         """Extract a likely ticker symbol token from free-form text."""
         if not text:
             return None
+        # Prefer an explicit parenthesized ticker, e.g. "Apple Inc. (AAPL)".
+        parenthesized = re.search(r"\(([A-Za-z]{2,8}(?:-[A-Za-z])?)\)", text)
+        if parenthesized:
+            return parenthesized.group(1).upper()
         # Prefer explicit symbol/ticker patterns before generic uppercase tokens.
         explicit = re.search(
-            r"\b(?:symbol|ticker)\s*(?:is|=|:)?\s*([A-Za-z]{1,6})\b",
+            r"\b(?:symbol|ticker)\s*(?:is|=|:)?\s*([A-Za-z]{2,8}(?:-[A-Za-z])?)\b",
             text,
             re.IGNORECASE,
         )
         if explicit:
             return explicit.group(1).upper()
-        generic = re.search(r"\b([A-Z]{1,6})\b", text)
+        generic = re.search(r"\b([A-Z]{2,6})\b", text)
         if generic:
             return generic.group(1)
         return None
@@ -282,6 +310,36 @@ class TimeSeriesConstructionProcessor:
         return None
 
     @staticmethod
+    def _extract_unavailable_market_sources_from_messages(
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        """Extract structured unavailable-source records from prior tool results."""
+        unavailable: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            try:
+                payload = json.loads(message["content"].replace("Tool result: ", "", 1))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("market_data_available") is True:
+                continue
+            if payload.get("market_data_available") is False or payload.get("non_fatal") is True:
+                source = str(payload.get("source", "")).strip().casefold()
+                reason = str(payload.get("error", payload.get("message", "source unavailable"))).strip()
+                if not source:
+                    continue
+                key = (source, reason)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unavailable.append({"source": source, "reason": reason})
+        return unavailable
+
+    @staticmethod
     def _log_continuation_decision(
         agent: str,
         iteration: int,
@@ -302,6 +360,7 @@ class TimeSeriesConstructionProcessor:
     def _extract_quality_rows_from_messages(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
         """Extract quality rows from prior tool results or transfer context."""
         rows: list[dict[str, Any]] = []
+        historical_by_source: dict[str, dict[str, Any]] = {}
 
         # First: direct tool results from check_data_quality.
         for message in messages:
@@ -313,6 +372,15 @@ class TimeSeriesConstructionProcessor:
                 continue
             if isinstance(payload, dict) and payload.get("source") and "completeness_pct" in payload:
                 rows.append(payload)
+            if (
+                isinstance(payload, dict)
+                and payload.get("source")
+                and isinstance(payload.get("dates"), list)
+                and isinstance(payload.get("prices"), list)
+            ):
+                source_key = str(payload.get("source", "")).strip().casefold()
+                if source_key and source_key not in historical_by_source:
+                    historical_by_source[source_key] = payload
 
         # Fallback: parse delegated transfer context "Quality data: [...]".
         if not rows:
@@ -346,6 +414,27 @@ class TimeSeriesConstructionProcessor:
             if not source or source in seen_sources:
                 continue
             seen_sources.add(source)
+
+            # Enrich from historical_prices payload when quality rows are sparse.
+            historical = historical_by_source.get(source)
+            if historical is not None:
+                dates = historical.get("dates")
+                prices = historical.get("prices")
+                if isinstance(dates, list) and isinstance(prices, list) and len(dates) == len(prices):
+                    available_indices = [index for index, value in enumerate(prices) if value is not None]
+                    if item.get("available_record_count") is None:
+                        item["available_record_count"] = len(available_indices)
+                    if available_indices:
+                        if item.get("min_date") is None:
+                            item["min_date"] = str(dates[min(available_indices)])
+                        if item.get("max_date") is None:
+                            item["max_date"] = str(dates[max(available_indices)])
+                        observed_prices = [prices[index] for index in available_indices]
+                        if observed_prices and item.get("min_value") is None:
+                            item["min_value"] = float(min(observed_prices))
+                        if observed_prices and item.get("max_value") is None:
+                            item["max_value"] = float(max(observed_prices))
+
             deduped.append(item)
         return deduped
 
@@ -386,6 +475,17 @@ class TimeSeriesConstructionProcessor:
     def _extract_explicit_gap_method(text: str) -> str | None:
         """Extract an explicit gap-filling method choice from text."""
         lowered = str(text or "").casefold()
+        numeric_match = re.search(r"\b([1-4])\b", lowered)
+        if numeric_match:
+            numeric_map = {
+                "1": "linear_interpolation",
+                "2": "forward_fill",
+                "3": "backward_fill",
+                "4": "none",
+            }
+            mapped = numeric_map.get(numeric_match.group(1))
+            if mapped:
+                return mapped
         aliases = {
             "linear_interpolation": ["linear_interpolation", "linear interpolation"],
             "forward_fill": ["forward_fill", "forward fill", "ffill"],
@@ -438,7 +538,10 @@ class TimeSeriesConstructionProcessor:
         )
 
     @staticmethod
-    def _build_data_quality_report(quality_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def _build_data_quality_report(
+        quality_rows: list[dict[str, Any]],
+        unavailable_sources: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
         """Build a JSON-serializable data quality report.
 
         The rows payload is list-of-dicts so it can be serialized directly to a
@@ -447,15 +550,25 @@ class TimeSeriesConstructionProcessor:
         normalized_rows: list[dict[str, Any]] = []
         completeness_candidates: list[tuple[str, float]] = []
         total_missing = 0
+        total_available = 0
         symbol = None
+        min_dates: list[str] = []
+        max_dates: list[str] = []
+        min_values: list[float] = []
+        max_values: list[float] = []
 
         for item in quality_rows:
             row = {
                 "source": item.get("source"),
                 "symbol": item.get("symbol"),
                 "total_values": item.get("total_values"),
+                "available_record_count": item.get("available_record_count"),
                 "missing_count": item.get("missing_count", item.get("nan_count")),
                 "completeness_pct": item.get("completeness_pct"),
+                "min_value": item.get("min_value"),
+                "max_value": item.get("max_value"),
+                "min_date": item.get("min_date"),
+                "max_date": item.get("max_date"),
                 "duplicate_count": item.get("duplicate_count"),
                 "issues": item.get("issues", []),
                 "note": item.get("note"),
@@ -468,6 +581,26 @@ class TimeSeriesConstructionProcessor:
             missing_value = row.get("missing_count")
             if isinstance(missing_value, int):
                 total_missing += missing_value
+
+            available_value = row.get("available_record_count")
+            if isinstance(available_value, int):
+                total_available += available_value
+
+            min_date = row.get("min_date")
+            if isinstance(min_date, str) and min_date:
+                min_dates.append(min_date)
+
+            max_date = row.get("max_date")
+            if isinstance(max_date, str) and max_date:
+                max_dates.append(max_date)
+
+            min_value = row.get("min_value")
+            if isinstance(min_value, (int, float)):
+                min_values.append(float(min_value))
+
+            max_value = row.get("max_value")
+            if isinstance(max_value, (int, float)):
+                max_values.append(float(max_value))
 
             completeness_value = row.get("completeness_pct")
             if isinstance(completeness_value, (int, float)) and row.get("source"):
@@ -484,6 +617,13 @@ class TimeSeriesConstructionProcessor:
                 2,
             )
 
+        unavailable_sources = unavailable_sources or []
+        unavailable_source_names = [
+            item.get("source")
+            for item in unavailable_sources
+            if item.get("source")
+        ]
+
         return {
             "report_type": "data_quality_summary",
             "rows": normalized_rows,
@@ -491,11 +631,19 @@ class TimeSeriesConstructionProcessor:
                 "symbol": symbol,
                 "source_count": len(normalized_rows),
                 "sources": [row.get("source") for row in normalized_rows if row.get("source")],
+                "unavailable_source_count": len(unavailable_sources),
+                "unavailable_sources": unavailable_source_names,
+                "total_available_records": total_available,
                 "total_missing_count": total_missing,
+                "min_date": min(min_dates) if min_dates else None,
+                "max_date": max(max_dates) if max_dates else None,
+                "min_value": min(min_values) if min_values else None,
+                "max_value": max(max_values) if max_values else None,
                 "average_completeness_pct": average_completeness,
                 "best_source_by_completeness": best_source,
                 "worst_source_by_completeness": worst_source,
             },
+            "unavailable_sources": unavailable_sources,
         }
 
     @staticmethod
@@ -535,12 +683,106 @@ class TimeSeriesConstructionProcessor:
         auto_progress = self._try_auto_progress_orchestrator(state, user_input)
         if auto_progress is not None:
             return auto_progress
+        gapfilling_resume = self._try_resume_gapfilling_from_method_selection(state, user_input)
+        if gapfilling_resume is not None:
+            return gapfilling_resume
         messages = state["messages"] + [{"role": "user", "content": user_input}]
         return self._run_agent(
             get_agent(state["agent"]),
             messages,
             state.get("iteration", 0),
         )
+
+    def _try_resume_gapfilling_from_method_selection(
+        self,
+        state: dict[str, Any],
+        user_input: str,
+    ) -> list[CallbackEvent] | None:
+        """Deterministically continue GapFilling after a method response.
+
+        When resuming from a GapFilling pause, local models may ignore the user
+        response and re-ask or emit a narrative answer without tool calls. If the
+        user provided an explicit method, apply it immediately from context and
+        continue to TimeSeriesConstructionAgent.
+        """
+        if state.get("agent") != "GapFillingAgent":
+            return None
+        if state.get("checkpoint") != "gap_method_selection":
+            return None
+
+        selected_method = self._extract_explicit_gap_method(user_input)
+        if not selected_method:
+            return None
+
+        base_messages = list(state.get("messages", []))
+        recovered_prices = self._recover_gapfilling_prices_from_context(
+            base_messages,
+            final_text=user_input,
+        )
+        if recovered_prices is None:
+            return None
+
+        apply_tool = get_tool("apply_gap_filling")
+        if apply_tool is None:
+            return None
+
+        apply_args = {
+            "prices": recovered_prices,
+            "method": selected_method,
+        }
+        try:
+            filled_result = apply_tool.invoke(apply_args)
+        except Exception as error:
+            self.handler.on_tool_error(error)
+            logger.exception("gapfilling_resume_apply_failed")
+            return [self._user_error("apply_gap_filling", str(error))]
+
+        if not (isinstance(filled_result, dict) and filled_result.get("prices")):
+            return None
+
+        agent = get_agent("GapFillingAgent")
+        if agent is None:
+            return None
+
+        iteration = int(state.get("iteration", 0) or 0)
+        self.handler.add_trace_record(
+            "tool_call",
+            {
+                "tool": "apply_gap_filling",
+                "description": get_tool_description("apply_gap_filling"),
+                "arguments": apply_args,
+            },
+            agent=agent.name,
+            iteration=iteration,
+        )
+        self.handler.add_trace_record(
+            "tool_result",
+            {
+                "tool": "apply_gap_filling",
+                "description": get_tool_description("apply_gap_filling"),
+                "result": filled_result,
+            },
+            agent=agent.name,
+            iteration=iteration,
+        )
+        logger.info(
+            "gapfilling_resume_auto_continue mode=deterministic method=%s symbol=%s",
+            selected_method,
+            filled_result.get("symbol"),
+        )
+
+        resumed_messages = base_messages + [
+            {"role": "user", "content": user_input},
+            {"role": "user", "content": f"Tool result: {json.dumps(filled_result, default=str)}"},
+        ]
+        continuation = self._continue_gapfilling_to_construction(
+            response=f"Final Answer: Gap-filling applied with {selected_method}.",
+            agent=agent,
+            messages=resumed_messages,
+            iteration=iteration,
+            visited=set(),
+        )
+        return continuation
 
     def _try_delegate_from_explicit_agent_response(
         self,
@@ -707,6 +949,12 @@ class TimeSeriesConstructionProcessor:
         for iteration in range(start, 10):
             log_workflow_progress(agent.name, iteration, "llm_call")
             logger.info("agent_iteration agent=%s iteration=%d", agent.name, iteration)
+            self._debug_flow_event(
+                component="processor",
+                stage="llm_call",
+                agent=agent.name,
+                iteration=iteration,
+            )
 
             # Log message size to track growing conversation history
             log_message_size(agent.name, iteration, messages)
@@ -832,6 +1080,13 @@ class TimeSeriesConstructionProcessor:
                 "agent_actions agent=%s iteration=%d count=%d",
                 agent.name, iteration, len(calls),
             )
+            self._debug_flow_event(
+                component="processor",
+                stage="parsed_actions",
+                agent=agent.name,
+                iteration=iteration,
+                detail=f"count={len(calls)}",
+            )
             if calls:
                 logger.info(
                     "agent_actions_detail agent=%s iteration=%d tools=%s",
@@ -841,6 +1096,59 @@ class TimeSeriesConstructionProcessor:
                 )
 
             if not calls:
+                if agent.name == "TimeSeriesConstructionAgent":
+                    deterministic_construction = self._continue_construction_to_reporting(
+                        response,
+                        agent,
+                        messages,
+                        iteration,
+                        visited,
+                    )
+                    if deterministic_construction is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail="construction_recovered_after_unparseable_actions",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            "construction_recovered_after_unparseable_actions",
+                        )
+                        return deterministic_construction
+                if (
+                    agent.name == "ReportingAgent"
+                    and any(
+                        _REPORTING_FINAL_SUMMARY_NOTE in msg.get("content", "")
+                        for msg in messages
+                        if msg.get("role") == "user"
+                    )
+                ):
+                    summary_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response.strip()
+                    self._log_continuation_decision(
+                        agent.name,
+                        iteration,
+                        "completed",
+                        "reporting_final_summary_terminal",
+                    )
+                    logger.info(
+                        "agent_completed agent=%s iteration=%d reason=reporting_final_summary_terminal",
+                        agent.name,
+                        iteration,
+                    )
+                    self.handler.emit(
+                        CallbackEvent(
+                            CallbackEventType.AGENT_COMPLETED,
+                            {
+                                "agent": agent.name,
+                                "result": {"final_answer": summary_text},
+                            },
+                        )
+                    )
+                    return self._drain()
                 recovery = self._recover_orchestrator_delegation(
                     response, agent, messages, iteration, visited,
                 )
@@ -851,6 +1159,12 @@ class TimeSeriesConstructionProcessor:
                         "role": "user",
                         "content": "Use the required Action and Action Input JSON format.",
                     }
+                )
+                self._debug_flow_event(
+                    component="processor",
+                    stage="re_prompt_for_action_format",
+                    agent=agent.name,
+                    iteration=iteration,
                 )
                 continue
                 self.handler.add_trace_record(
@@ -997,6 +1311,7 @@ class TimeSeriesConstructionProcessor:
         - DataQualityAgent → ReportingAgent (when quality metrics are computed)
         - ReportingAgent → GapFillingAgent (when user has selected a source)
         - GapFillingAgent → TimeSeriesConstructionAgent (when gap-filling is applied)
+        - TimeSeriesConstructionAgent → ReportingAgent (final summary)
 
         Args:
             response: The LLM response containing the Final Answer.
@@ -1027,6 +1342,10 @@ class TimeSeriesConstructionProcessor:
         # --- GapFillingAgent → TimeSeriesConstructionAgent ---
         if agent.name == "GapFillingAgent":
             return self._continue_gapfilling_to_construction(response, agent, messages, iteration, visited)
+
+        # --- TimeSeriesConstructionAgent → ReportingAgent ---
+        if agent.name == "TimeSeriesConstructionAgent":
+            return self._continue_construction_to_reporting(response, agent, messages, iteration, visited)
 
         self._log_continuation_decision(
             agent.name,
@@ -1174,6 +1493,7 @@ class TimeSeriesConstructionProcessor:
         """
         # Look for loaded data sources in tool results
         loaded_sources = []
+        unavailable_sources = []
         resolved_symbol = None
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
@@ -1183,8 +1503,16 @@ class TimeSeriesConstructionProcessor:
                         loaded_sources.append(tool_result["source"])
                         if not resolved_symbol and tool_result.get("symbol"):
                             resolved_symbol = tool_result["symbol"]
+                    elif isinstance(tool_result, dict) and tool_result.get("market_data_available") is False:
+                        source = str(tool_result.get("source", "")).strip().casefold()
+                        reason = str(tool_result.get("error", "source unavailable")).strip()
+                        if source:
+                            unavailable_sources.append({"source": source, "reason": reason})
                 except (json.JSONDecodeError, KeyError):
                     continue
+
+        if not unavailable_sources:
+            unavailable_sources = self._extract_unavailable_market_sources_from_messages(messages)
 
         original_request = self._extract_original_request_from_messages(messages)
         final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
@@ -1209,6 +1537,35 @@ class TimeSeriesConstructionProcessor:
             )
 
         if not loaded_sources:
+            if unavailable_sources:
+                unavailable_summary = "; ".join(
+                    f"{item['source']}: {item['reason']}"
+                    for item in unavailable_sources
+                    if item.get("source")
+                )
+                logger.warning(
+                    "market_all_sources_unavailable symbol=%s details=%s",
+                    resolved_symbol,
+                    unavailable_summary,
+                )
+                return [
+                    CallbackEvent(
+                        CallbackEventType.ERROR,
+                        {
+                            "agent": agent.name,
+                            "message": (
+                                "Market data is not available for the requested range/source set. "
+                                f"Unavailable sources: {unavailable_summary}."
+                            ),
+                            "recoverable": True,
+                            "user_action": (
+                                "Try another date range, ticker, or data source and run the workflow again."
+                            ),
+                            "unavailable_sources": unavailable_sources,
+                        },
+                        self.handler.session_id,
+                    )
+                ]
             self._log_continuation_decision(
                 agent.name,
                 iteration,
@@ -1224,6 +1581,7 @@ class TimeSeriesConstructionProcessor:
         transfer_request = (
             f"Check data quality for {resolved_symbol or 'the instrument'} "
             f"from sources: {', '.join(loaded_sources)}. "
+            f"Unavailable sources: {json.dumps(unavailable_sources)}. "
             f"Original request: {original_request}"
         )
 
@@ -1243,7 +1601,14 @@ class TimeSeriesConstructionProcessor:
         continuation_events = [
             CallbackEvent(
                 CallbackEventType.AGENT_COMPLETED,
-                {"agent": agent.name, "result": {"delegated_to": quality_agent.name}},
+                {
+                    "agent": agent.name,
+                    "result": {
+                        "delegated_to": quality_agent.name,
+                        "loaded_sources": loaded_sources,
+                        "unavailable_sources": unavailable_sources,
+                    },
+                },
                 self.handler.session_id,
             ),
             CallbackEvent(
@@ -1282,6 +1647,7 @@ class TimeSeriesConstructionProcessor:
         """
         # Look for quality check results in tool results
         quality_sources = []
+        unavailable_sources = self._extract_unavailable_market_sources_from_messages(messages)
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
                 try:
@@ -1292,29 +1658,108 @@ class TimeSeriesConstructionProcessor:
                     continue
 
         if not quality_sources:
-            # Fallback: continue with instruction to produce comparison + source selection,
-            # even when the model omitted explicit check_data_quality tool calls.
+            # Fallback: compute quality metrics deterministically even when the
+            # model omitted explicit check_data_quality tool calls.
             original_request = self._extract_original_request_from_messages(messages)
             symbol_guess = self._extract_symbol_candidate_from_text(response)
             if not symbol_guess:
                 symbol_guess = self._extract_symbol_candidate_from_text(original_request)
-            quality_sources = [
-                {
-                    "source": "yahoo",
-                    "symbol": symbol_guess or "UNKNOWN",
-                    "note": "fallback_context_only",
-                },
-                {
-                    "source": "bloomberg",
-                    "symbol": symbol_guess or "UNKNOWN",
-                    "note": "fallback_context_only",
-                },
-                {
-                    "source": "reuters",
-                    "symbol": symbol_guess or "UNKNOWN",
-                    "note": "fallback_context_only",
-                },
-            ]
+
+            # Prefer historical payloads already present in context.
+            historical_payloads: dict[str, dict[str, Any]] = {}
+            for message in messages:
+                if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                    continue
+                try:
+                    parsed = json.loads(message["content"].replace("Tool result: ", "", 1))
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(parsed, dict)
+                    and parsed.get("source")
+                    and isinstance(parsed.get("dates"), list)
+                    and isinstance(parsed.get("prices"), list)
+                ):
+                    source_key = str(parsed.get("source", "")).strip().casefold()
+                    if source_key and source_key not in historical_payloads:
+                        historical_payloads[source_key] = parsed
+
+            candidate_sources = list(historical_payloads.keys())
+            if not candidate_sources:
+                candidate_sources = self._extract_sources_from_text(response)
+            if not candidate_sources:
+                candidate_sources = self._extract_sources_from_text(original_request)
+            if not candidate_sources:
+                candidate_sources = ["yahoo", "bloomberg", "reuters"]
+
+            start_date = None
+            end_date = None
+            try:
+                extracted = extract_date_range(original_request)
+            except ValueError:
+                extracted = None
+            if extracted is not None:
+                start_date, end_date = extracted
+
+            quality_tool = get_tool("check_data_quality")
+            recovered_quality_sources: list[dict[str, Any]] = []
+
+            if quality_tool is not None:
+                for source in candidate_sources:
+                    source_key = str(source).strip().casefold()
+                    if not source_key:
+                        continue
+                    tool_args: dict[str, Any]
+                    payload = historical_payloads.get(source_key)
+                    if payload is not None:
+                        tool_args = {"data": payload}
+                    else:
+                        tool_args = {
+                            "source": source_key,
+                            "symbol": symbol_guess or "UNKNOWN",
+                        }
+                        if start_date:
+                            tool_args["start_date"] = start_date
+                        if end_date:
+                            tool_args["end_date"] = end_date
+                    try:
+                        quality_result = quality_tool.invoke(tool_args)
+                    except Exception:
+                        continue
+                    if isinstance(quality_result, dict) and quality_result.get("source"):
+                        recovered_quality_sources.append(quality_result)
+                        self.handler.add_trace_record(
+                            "tool_call",
+                            {
+                                "tool": "check_data_quality",
+                                "description": get_tool_description("check_data_quality"),
+                                "arguments": tool_args,
+                            },
+                            agent=agent.name,
+                            iteration=iteration,
+                        )
+                        self.handler.add_trace_record(
+                            "tool_result",
+                            {
+                                "tool": "check_data_quality",
+                                "description": get_tool_description("check_data_quality"),
+                                "result": quality_result,
+                            },
+                            agent=agent.name,
+                            iteration=iteration,
+                        )
+
+            if recovered_quality_sources:
+                quality_sources = recovered_quality_sources
+            else:
+                quality_sources = [
+                    {
+                        "source": source,
+                        "symbol": symbol_guess or "UNKNOWN",
+                        "note": "fallback_context_only",
+                    }
+                    for source in candidate_sources
+                ]
             logger.warning(
                 "quality_metrics_recovered mode=deterministic symbol=%s reason=final_answer_without_tool_results",
                 symbol_guess,
@@ -1325,17 +1770,19 @@ class TimeSeriesConstructionProcessor:
             return None
 
         # Build transfer request with quality context
-        all_user_text = " ".join(
+        user_texts = [
             msg.get("content", "")
             for msg in messages
             if msg.get("role") == "user"
-        ).strip()
+        ]
+        all_user_text = " ".join(user_texts).strip()
         original_match = re.search(r"original_request=(.+)", all_user_text)
         original_request = original_match.group(1).strip() if original_match else all_user_text
 
         transfer_request = (
             f"Present quality report and ask the user to select a source. "
             f"Quality data: {json.dumps(quality_sources)}. "
+            f"Unavailable sources: {json.dumps(unavailable_sources)}. "
             f"Original request: {original_request}"
         )
 
@@ -1351,7 +1798,10 @@ class TimeSeriesConstructionProcessor:
             f"quality_to_reporting sources={len(quality_sources)}",
         )
 
-        quality_report = self._build_data_quality_report(quality_sources)
+        quality_report = self._build_data_quality_report(
+            quality_sources,
+            unavailable_sources=unavailable_sources,
+        )
 
         continuation_events = [
             CallbackEvent(
@@ -1399,6 +1849,19 @@ class TimeSeriesConstructionProcessor:
         Checks if the user has provided a source selection in the conversation
         (either via the paused state user_response or in the final answer).
         """
+        if any(
+            _REPORTING_FINAL_SUMMARY_NOTE in msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        ):
+            self._log_continuation_decision(
+                agent.name,
+                iteration,
+                "completed",
+                "reporting_final_summary_mode",
+            )
+            return None
+
         # Check if the final answer or explicit user response contains a source selection
         final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
 
@@ -1461,11 +1924,12 @@ class TimeSeriesConstructionProcessor:
         if gap_agent is None:
             return None
 
-        all_user_text = " ".join(
+        user_texts = [
             msg.get("content", "")
             for msg in messages
             if msg.get("role") == "user"
-        ).strip()
+        ]
+        all_user_text = " ".join(user_texts).strip()
         original_match = re.search(r"original_request=(.+)", all_user_text)
         original_request = original_match.group(1).strip() if original_match else all_user_text
 
@@ -1552,48 +2016,98 @@ class TimeSeriesConstructionProcessor:
                 selected_method = self._extract_explicit_gap_method(final_text)
 
             if selected_method:
+                recovered_prices = self._recover_gapfilling_prices_from_context(
+                    messages,
+                    final_text,
+                )
+                if recovered_prices is not None:
+                    apply_tool = get_tool("apply_gap_filling")
+                    if apply_tool is None:
+                        return None
+                    apply_args = {
+                        "prices": recovered_prices,
+                        "method": selected_method,
+                    }
+                    try:
+                        filled_result = apply_tool.invoke(apply_args)
+                    except Exception as error:
+                        self.handler.on_tool_error(error)
+                        logger.exception("gapfilling_recovery_apply_failed")
+                        return [self._user_error("apply_gap_filling", str(error))]
+                    if isinstance(filled_result, dict) and filled_result.get("prices"):
+                        filled_data = filled_result
+                        self.handler.add_trace_record(
+                            "tool_call",
+                            {
+                                "tool": "apply_gap_filling",
+                                "description": get_tool_description("apply_gap_filling"),
+                                "arguments": apply_args,
+                            },
+                            agent=agent.name,
+                            iteration=iteration,
+                        )
+                        self.handler.add_trace_record(
+                            "tool_result",
+                            {
+                                "tool": "apply_gap_filling",
+                                "description": get_tool_description("apply_gap_filling"),
+                                "result": filled_result,
+                            },
+                            agent=agent.name,
+                            iteration=iteration,
+                        )
+                        logger.info(
+                            "gapfilling_recovered_apply mode=deterministic symbol=%s method=%s",
+                            filled_data.get("symbol"),
+                            selected_method,
+                        )
+
+                if filled_data is None:
+                    self._log_continuation_decision(
+                        agent.name,
+                        iteration,
+                        "completed",
+                        f"gapfilling_explicit_method_detected_without_filled_data method={selected_method}",
+                    )
+                    return None
+
+            if filled_data is None:
                 self._log_continuation_decision(
                     agent.name,
                     iteration,
-                    "completed",
-                    f"gapfilling_explicit_method_detected_without_filled_data method={selected_method}",
+                    "pausing",
+                    "gapfilling_requires_method_or_filled_data",
                 )
-                return None
-
-            self._log_continuation_decision(
-                agent.name,
-                iteration,
-                "pausing",
-                "gapfilling_requires_method_or_filled_data",
-            )
-            options = self._extract_gap_method_options_from_messages(messages)
-            prompt = self._build_gap_method_prompt(options)
-            self.handler.request_human_input(
-                prompt,
-                options=options,
-                context={"checkpoint": "gap_method_selection"},
-            )
-            self.handler.paused_state = {
-                "agent": agent.name,
-                "messages": messages.copy(),
-                "iteration": iteration + 1,
-            }
-            logger.info(
-                "gapfilling_forced_pause mode=deterministic iteration=%d options=%s reason=missing_explicit_method_selection",
-                iteration,
-                options,
-            )
-            return self._drain()
+                options = self._extract_gap_method_options_from_messages(messages)
+                prompt = self._build_gap_method_prompt(options)
+                self.handler.request_human_input(
+                    prompt,
+                    options=options,
+                    context={"checkpoint": "gap_method_selection"},
+                )
+                self.handler.paused_state = {
+                    "agent": agent.name,
+                    "messages": messages.copy(),
+                    "iteration": iteration + 1,
+                    "checkpoint": "gap_method_selection",
+                }
+                logger.info(
+                    "gapfilling_forced_pause mode=deterministic iteration=%d options=%s reason=missing_explicit_method_selection",
+                    iteration,
+                    options,
+                )
+                return self._drain()
 
         construction_agent = get_agent("TimeSeriesConstructionAgent")
         if construction_agent is None:
             return None
 
-        all_user_text = " ".join(
+        user_texts = [
             msg.get("content", "")
             for msg in messages
             if msg.get("role") == "user"
-        ).strip()
+        ]
+        all_user_text = " ".join(user_texts).strip()
         original_match = re.search(r"original_request=(.+)", all_user_text)
         original_request = original_match.group(1).strip() if original_match else all_user_text
 
@@ -1644,6 +2158,375 @@ class TimeSeriesConstructionProcessor:
 
         return continuation_events + (target_result if self._is_event_list(target_result) else [])
 
+    @staticmethod
+    def _extract_prices_payload_from_messages(messages: list[dict[str, str]]) -> dict[str, Any] | None:
+        """Extract a price series payload (dates/prices/symbol) from conversation context."""
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            try:
+                parsed = json.loads(message["content"].replace("Tool result: ", "", 1))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            if parsed.get("dates") and parsed.get("prices") and parsed.get("symbol"):
+                return parsed
+        return None
+
+    def _recover_gapfilling_prices_from_context(
+        self,
+        messages: list[dict[str, str]],
+        final_text: str,
+    ) -> dict[str, Any] | None:
+        """Recover missing prices for deterministic gap-filling continuation.
+
+        Priority:
+        1) Existing tool result payload in current context.
+        2) Deterministic historical_prices retrieval from symbol/source/date range.
+        """
+        direct_payload = self._extract_prices_payload_from_messages(messages)
+        if direct_payload is not None:
+            return direct_payload
+
+        user_texts = [
+            msg.get("content", "")
+            for msg in messages
+            if msg.get("role") == "user"
+        ]
+        all_user_text = " ".join(user_texts).strip()
+        original_request = self._extract_original_request_from_messages(messages)
+        symbol = (
+            self._extract_symbol_candidate_from_text(all_user_text)
+            or self._extract_symbol_candidate_from_text(final_text)
+            or self._extract_symbol_candidate_from_text(original_request)
+        )
+
+        selected_source = self._extract_explicit_source_selection(all_user_text)
+        if not selected_source:
+            selected_source = self._extract_explicit_source_selection(final_text)
+        if not selected_source:
+            sources = self._extract_sources_from_text(all_user_text)
+            selected_source = sources[0] if len(sources) == 1 else None
+
+        date_range = None
+        date_candidates = [original_request, *user_texts, all_user_text, final_text]
+        for candidate in date_candidates:
+            if not candidate:
+                continue
+            try:
+                parsed_range = extract_date_range(candidate)
+            except ValueError:
+                parsed_range = None
+            if parsed_range is not None:
+                date_range = parsed_range
+                break
+
+        if date_range is None:
+            for candidate in date_candidates:
+                if not candidate:
+                    continue
+                match = re.search(
+                    r"(\d{4}-\d{2}-\d{2}).*?(\d{4}-\d{2}-\d{2})",
+                    candidate,
+                    flags=re.DOTALL,
+                )
+                if not match:
+                    continue
+                try:
+                    date_range = normalize_date_range(match.group(1), match.group(2))
+                except ValueError:
+                    date_range = None
+                if date_range is not None:
+                    break
+
+        if not symbol or not selected_source or date_range is None:
+            logger.info(
+                "gapfilling_price_recovery_skipped symbol=%s source=%s has_dates=%s",
+                symbol,
+                selected_source,
+                date_range is not None,
+            )
+            return None
+
+        start_date, end_date = date_range
+        historical_tool = get_tool("historical_prices")
+        if historical_tool is None:
+            return None
+
+        call_args = {
+            "symbol": symbol,
+            "start_date": start_date,
+            "end_date": end_date,
+            "source": selected_source,
+        }
+        try:
+            result = historical_tool.invoke(call_args)
+        except Exception as error:
+            self.handler.on_tool_error(error)
+            logger.exception("gapfilling_price_recovery_failed")
+            return None
+
+        if isinstance(result, dict) and result.get("dates") and result.get("prices"):
+            self.handler.add_trace_record(
+                "tool_call",
+                {
+                    "tool": "historical_prices",
+                    "description": get_tool_description("historical_prices"),
+                    "arguments": call_args,
+                },
+                agent="GapFillingAgent",
+            )
+            self.handler.add_trace_record(
+                "tool_result",
+                {
+                    "tool": "historical_prices",
+                    "description": get_tool_description("historical_prices"),
+                    "result": result,
+                },
+                agent="GapFillingAgent",
+            )
+            logger.info(
+                "gapfilling_price_recovery_completed symbol=%s source=%s start=%s end=%s",
+                symbol,
+                selected_source,
+                start_date,
+                end_date,
+            )
+            return result
+        return None
+
+    @staticmethod
+    def _extract_filled_data_from_messages(messages: list[dict[str, str]]) -> dict[str, Any] | None:
+        """Extract filled series payload from tool results or transfer context."""
+        for message in messages:
+            if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
+                try:
+                    tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("prices"):
+                    return tool_result
+
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            text = message.get("content", "")
+            match = re.search(
+                r"Filled data:\s*(\{.*?\})(?:\s*\.\s*Original request:|$)",
+                text,
+                flags=re.DOTALL,
+            )
+            if not match:
+                continue
+            try:
+                parsed = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("prices"):
+                return parsed
+        return None
+
+    @staticmethod
+    def _extract_artifact_paths_from_messages(messages: list[dict[str, str]]) -> tuple[str | None, str | None]:
+        """Extract generated CSV/PNG artifact paths from construction-stage tool results."""
+        csv_path: str | None = None
+        chart_path: str | None = None
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            raw = message["content"].replace("Tool result: ", "", 1)
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            candidate: str | None = None
+            if isinstance(parsed, str):
+                candidate = parsed
+            elif isinstance(parsed, dict):
+                for key in ("path", "output", "file"):
+                    value = parsed.get(key)
+                    if isinstance(value, str) and value:
+                        candidate = value
+                        break
+
+            if not candidate:
+                continue
+            lowered = candidate.casefold()
+            if lowered.endswith(".csv"):
+                csv_path = candidate
+            elif lowered.endswith(".png"):
+                chart_path = candidate
+        return csv_path, chart_path
+
+    def _continue_construction_to_reporting(
+        self,
+        response: str,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        visited: set[str],
+    ) -> list[CallbackEvent] | None:
+        """Auto-delegate from TimeSeriesConstructionAgent to ReportingAgent for final summary.
+
+        Ensures both final artifacts exist. If local-model output skipped one of the
+        tool calls, this method deterministically produces missing artifacts before
+        delegating to ReportingAgent for a final summary.
+        """
+        reporting_agent = get_agent("ReportingAgent")
+        if reporting_agent is None:
+            return None
+
+        filled_data = self._extract_filled_data_from_messages(messages)
+        csv_path, chart_path = self._extract_artifact_paths_from_messages(messages)
+
+        if filled_data is not None:
+            if not csv_path:
+                build_tool = get_tool("build_timeseries")
+                if build_tool is None:
+                    return None
+                build_args = {
+                    "series": filled_data,
+                    "filename": "final_timeseries.csv",
+                    "run_id": self.handler.session_id,
+                }
+                try:
+                    csv_result = build_tool.invoke(build_args)
+                except Exception as error:
+                    self.handler.on_tool_error(error)
+                    logger.exception("construction_artifact_build_failed")
+                    return [self._user_error("build_timeseries", str(error))]
+                csv_path = str(csv_result)
+                self.handler.add_trace_record(
+                    "tool_call",
+                    {
+                        "tool": "build_timeseries",
+                        "description": get_tool_description("build_timeseries"),
+                        "arguments": build_args,
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
+                )
+                self.handler.add_trace_record(
+                    "tool_result",
+                    {
+                        "tool": "build_timeseries",
+                        "description": get_tool_description("build_timeseries"),
+                        "result": csv_result,
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
+                )
+            if not chart_path:
+                visualize_tool = get_tool("visualize_timeseries")
+                if visualize_tool is None:
+                    return None
+                title_symbol = str(filled_data.get("symbol") or "Instrument")
+                visual_args = {
+                    "prices": filled_data,
+                    "title": f"{title_symbol} continuous time series",
+                    "run_id": self.handler.session_id,
+                }
+                try:
+                    chart_result = visualize_tool.invoke(visual_args)
+                except Exception as error:
+                    self.handler.on_tool_error(error)
+                    logger.exception("construction_artifact_visualization_failed")
+                    return [self._user_error("visualize_timeseries", str(error))]
+                chart_path = str(chart_result)
+                self.handler.add_trace_record(
+                    "tool_call",
+                    {
+                        "tool": "visualize_timeseries",
+                        "description": get_tool_description("visualize_timeseries"),
+                        "arguments": visual_args,
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
+                )
+                self.handler.add_trace_record(
+                    "tool_result",
+                    {
+                        "tool": "visualize_timeseries",
+                        "description": get_tool_description("visualize_timeseries"),
+                        "result": chart_result,
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
+                )
+
+        if not csv_path or not chart_path:
+            self._log_continuation_decision(
+                agent.name,
+                iteration,
+                "completed",
+                "construction_to_reporting_skipped_missing_artifacts",
+            )
+            return None
+
+        original_request = self._extract_original_request_from_messages(messages)
+        symbol = str((filled_data or {}).get("symbol") or "the instrument")
+        method = str((filled_data or {}).get("method") or "selected")
+        transfer_request = (
+            f"{_REPORTING_FINAL_SUMMARY_NOTE} "
+            f"Provide the final workflow summary for {symbol}. "
+            f"Gap filling method: {method}. "
+            f"CSV artifact: {csv_path}. "
+            f"Chart artifact: {chart_path}. "
+            f"Original request: {original_request}"
+        )
+
+        logger.info(
+            "construction_auto_continue mode=deterministic to_agent=%s symbol=%s csv=%s chart=%s reason=construction_completed_with_artifacts",
+            reporting_agent.name,
+            symbol,
+            csv_path,
+            chart_path,
+        )
+        self._log_continuation_decision(
+            agent.name,
+            iteration,
+            "delegating",
+            f"construction_to_reporting symbol={symbol}",
+        )
+
+        continuation_events = [
+            CallbackEvent(
+                CallbackEventType.AGENT_COMPLETED,
+                {
+                    "agent": agent.name,
+                    "result": {
+                        "delegated_to": reporting_agent.name,
+                        "timeseries_csv": csv_path,
+                        "timeseries_chart": chart_path,
+                    },
+                },
+                self.handler.session_id,
+            ),
+            CallbackEvent(
+                CallbackEventType.DELEGATED,
+                {
+                    "from_agent": agent.name,
+                    "to_agent": reporting_agent.name,
+                    "request": transfer_request,
+                    "routing_mode": "deterministic",
+                    "routing_reason": "bypassed user prompt: TimeSeriesConstructionAgent completed with artifacts, auto-delegating to ReportingAgent for final summary",
+                },
+                self.handler.session_id,
+            ),
+        ]
+
+        revisit_allowed = visited.copy()
+        revisit_allowed.discard(reporting_agent.name)
+        target_result = self._run_agent(
+            reporting_agent,
+            [{"role": "user", "content": transfer_request}],
+            visited=revisit_allowed,
+        )
+
+        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+
     def _execute(
         self,
         call: dict[str, Any],
@@ -1688,6 +2571,13 @@ class TimeSeriesConstructionProcessor:
                     )
         logger.info(
             "tool_started agent=%s tool=%s iteration=%d", agent.name, name, iteration,
+        )
+        self._debug_flow_event(
+            component="tool_dispatch",
+            stage="start",
+            agent=agent.name,
+            iteration=iteration,
+            detail=name,
         )
         logger.info(
             "workflow_tool agent=%s iteration=%d tool=%s phase=start description=%s",
@@ -1809,6 +2699,87 @@ class TimeSeriesConstructionProcessor:
                         "retrieving all available sources"
                     ),
                 }
+            if agent.name == "GapFillingAgent":
+                # Prevent re-asking loop when the user already selected a valid method.
+                last_user_message = next(
+                    (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
+                    "",
+                )
+                selected_method = self._extract_explicit_gap_method(last_user_message)
+                if selected_method:
+                    recovered_prices = self._recover_gapfilling_prices_from_context(
+                        messages,
+                        final_text="",
+                    )
+                    if recovered_prices is not None:
+                        apply_tool = get_tool("apply_gap_filling")
+                        if apply_tool is not None:
+                            apply_args = {
+                                "prices": recovered_prices,
+                                "method": selected_method,
+                            }
+                            try:
+                                filled_result = apply_tool.invoke(apply_args)
+                            except Exception as error:
+                                self.handler.on_tool_error(error)
+                                logger.exception("gapfilling_loop_bypass_apply_failed")
+                                return [self._user_error("apply_gap_filling", str(error))]
+                            self.handler.add_trace_record(
+                                "tool_call",
+                                {
+                                    "tool": "apply_gap_filling",
+                                    "description": get_tool_description("apply_gap_filling"),
+                                    "arguments": apply_args,
+                                },
+                                agent=agent.name,
+                                iteration=iteration,
+                            )
+                            self.handler.add_trace_record(
+                                "tool_result",
+                                {
+                                    "tool": "apply_gap_filling",
+                                    "description": get_tool_description("apply_gap_filling"),
+                                    "result": filled_result,
+                                },
+                                agent=agent.name,
+                                iteration=iteration,
+                            )
+                            logger.info(
+                                "gapfilling_request_input_bypassed mode=deterministic method=%s reason=user_already_selected_method",
+                                selected_method,
+                            )
+                            return filled_result
+        if name in {"build_timeseries", "visualize_timeseries"}:
+            recovered_filled_data = self._extract_filled_data_from_messages(messages)
+            if recovered_filled_data is not None:
+                payload_key = "series" if name == "build_timeseries" else "prices"
+                payload_value = args.get(payload_key)
+                if not isinstance(payload_value, dict) or (
+                    isinstance(recovered_filled_data.get("prices"), list)
+                    and len(recovered_filled_data.get("prices", [])) >= len(payload_value.get("prices", []))
+                ):
+                    merged_payload = dict(recovered_filled_data)
+                    if isinstance(payload_value, dict):
+                        for key, value in payload_value.items():
+                            if key not in {
+                                "dates",
+                                "prices",
+                                "filled_dates",
+                                "filled_prices",
+                                "original_dates",
+                                "original_prices",
+                                "method",
+                                "gap_filling_method",
+                            }:
+                                merged_payload.setdefault(key, value)
+                    args[payload_key] = merged_payload
+                    logger.info(
+                        "tool_arg_recovered agent=%s tool=%s source=filled_context symbol=%s method=%s",
+                        agent.name,
+                        name,
+                        merged_payload.get("symbol"),
+                        merged_payload.get("method"),
+                    )
             self.handler.request_human_input(
                 args.get("prompt", "Please choose an option."),
                 args.get("options"),
@@ -1818,8 +2789,16 @@ class TimeSeriesConstructionProcessor:
                 "agent": agent.name,
                 "messages": messages.copy(),
                 "iteration": iteration + 1,
+                "checkpoint": "gap_method_selection",
             }
             logger.info("agent_paused agent=%s iteration=%d", agent.name, iteration)
+            self._debug_flow_event(
+                component="processor",
+                stage="pause",
+                agent=agent.name,
+                iteration=iteration,
+                detail=f"tool={name}",
+            )
             return None
 
         if name == "delegate_to_agent":
@@ -1863,9 +2842,47 @@ class TimeSeriesConstructionProcessor:
                     iteration=iteration,
                 )
                 return {"error": "Unknown target agent."}
+
+            if (
+                agent.name == "GapFillingAgent"
+                and target.name == "TimeSeriesConstructionAgent"
+                and "Filled data:" not in delegated_request
+            ):
+                filled_data = self._extract_filled_data_from_messages(messages)
+                if filled_data is not None:
+                    original_request = self._extract_original_request_from_messages(messages)
+                    base_request = delegated_request or (
+                        "Build and persist the final continuous series using the selected gap-filling method."
+                    )
+                    delegated_request = (
+                        f"{base_request} "
+                        f"Filled data: {json.dumps(filled_data)}. "
+                        f"Original request: {original_request}"
+                    )
+                    logger.info(
+                        "gapfilling_delegate_enriched mode=deterministic target=%s symbol=%s method=%s",
+                        target.name,
+                        filled_data.get("symbol"),
+                        filled_data.get("method"),
+                    )
+
+            if (
+                agent.name == "TimeSeriesConstructionAgent"
+                and target.name == "ReportingAgent"
+                and _REPORTING_FINAL_SUMMARY_NOTE not in delegated_request
+            ):
+                delegated_request = f"{_REPORTING_FINAL_SUMMARY_NOTE} {delegated_request}".strip()
+
             logger.info(
                 "agent_delegated from_agent=%s to_agent=%s",
                 agent.name, target.name,
+            )
+            self._debug_flow_event(
+                component="processor",
+                stage="delegate",
+                agent=agent.name,
+                iteration=iteration,
+                detail=f"to={target.name}",
             )
             completion_result: dict[str, Any] = {"delegated_to": target.name}
             if agent.name == "DataQualityAgent":
@@ -1909,10 +2926,13 @@ class TimeSeriesConstructionProcessor:
                 return {"error": "Delegation request is empty."}
 
             # Run target agent
+            target_visited = visited.copy()
+            if agent.name == "TimeSeriesConstructionAgent" and target.name == "ReportingAgent":
+                target_visited.discard("ReportingAgent")
             target_result = self._run_agent(
                 target,
                 [{"role": "user", "content": delegated_request}],
-                visited=visited.copy(),
+                visited=target_visited,
             )
             # Combine delegation events with target result
             if self._is_event_list(target_result):
@@ -1955,6 +2975,39 @@ class TimeSeriesConstructionProcessor:
                 return [failure]
             return result
         except Exception as error:
+            if name == "historical_prices" and agent.name == "MarketDataAgent":
+                source = str(args.get("source", "")).strip().casefold() or "unknown"
+                symbol = str(args.get("symbol", "")).strip() or "unknown"
+                start_date = str(args.get("start_date", "")).strip()
+                end_date = str(args.get("end_date", "")).strip()
+                non_fatal_result = {
+                    "market_data_available": False,
+                    "non_fatal": True,
+                    "source": source,
+                    "symbol": symbol,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "error": str(error),
+                }
+                logger.warning(
+                    "market_data_unavailable_nonfatal symbol=%s source=%s start=%s end=%s error=%s",
+                    symbol,
+                    source,
+                    start_date,
+                    end_date,
+                    error,
+                )
+                self.handler.add_trace_record(
+                    "tool_result",
+                    {
+                        "tool": name,
+                        "description": tool_description,
+                        "result": non_fatal_result,
+                    },
+                    agent=agent.name,
+                    iteration=iteration,
+                )
+                return non_fatal_result
             self.handler.on_tool_error(error)
             logger.exception("tool_failed agent=%s tool=%s", agent.name, name)
             self.handler.add_trace_record(
@@ -2024,6 +3077,20 @@ class TimeSeriesConstructionProcessor:
             if "data" not in normalized and "source" in normalized and "prices" not in normalized:
                 # LLM passed source but not prices/symbol - likely a malformed call
                 pass
+        if tool_name == "build_timeseries":
+            if "series" not in normalized and isinstance(normalized.get("prices"), list) and isinstance(normalized.get("dates"), list):
+                normalized["series"] = {
+                    "symbol": normalized.get("symbol"),
+                    "source": normalized.get("source"),
+                    "method": normalized.get("method") or normalized.get("gap_filling_method"),
+                    "dates": normalized.get("dates"),
+                    "prices": normalized.get("prices"),
+                }
+            if "series" in normalized and isinstance(normalized["series"], dict):
+                series_payload = dict(normalized["series"])
+                if "method" not in series_payload and "gap_filling_method" in series_payload:
+                    series_payload["method"] = series_payload.get("gap_filling_method")
+                normalized["series"] = series_payload
         if tool_name in {"extract_requested_date_range", "normalize_requested_dates"}:
             if "request" not in normalized and "text" in normalized:
                 normalized["request"] = normalized["text"]

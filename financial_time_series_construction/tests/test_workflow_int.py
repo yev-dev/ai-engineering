@@ -193,6 +193,22 @@ class TestInstrumentResolution:
         assert "No instrument query" in result.get("message", "")
 
 
+class TestSymbolRecoveryHelpers:
+    """Processor recovery helpers should prefer real tickers and avoid false positives."""
+
+    def test_parenthesized_ticker_is_recovered(self) -> None:
+        """Parenthesized tickers like Apple (AAPL) should recover the ticker symbol."""
+        text = "Historical prices for Apple Inc. (AAPL) from 2023-01-01 to 2024-01-01"
+        symbol = TimeSeriesConstructionProcessor._extract_symbol_candidate_from_text(text)
+        assert symbol == "AAPL"
+
+    def test_one_letter_uppercase_token_is_ignored(self) -> None:
+        """Single-letter uppercase tokens should not be treated as ticker symbols."""
+        text = "Historical summary: I think the data looks complete."
+        symbol = TimeSeriesConstructionProcessor._extract_symbol_candidate_from_text(text)
+        assert symbol is None
+
+
 # ---------------------------------------------------------------------------
 # Tests – historical data loading
 # ---------------------------------------------------------------------------
@@ -232,10 +248,12 @@ class TestHistoricalData:
         assert prices["source"] == "reuters"
         assert len(prices["dates"]) > 0
 
-    def test_empty_date_range_raises(self, mock_data_dir: Path) -> None:
-        """Empty date range should raise ValueError."""
-        with pytest.raises(ValueError, match="No historical data is available"):
-            historical_prices("AAPL", "2021-01-01", "2021-01-31", "yahoo")
+    def test_empty_date_range_uses_closest_available_dates(self, mock_data_dir: Path) -> None:
+        """Out-of-range requests should snap to closest available dates."""
+        prices = historical_prices("AAPL", "2021-01-01", "2021-01-31", "yahoo")
+        assert prices["symbol"] == "AAPL"
+        assert prices["source"] == "yahoo"
+        assert len(prices["dates"]) > 0
 
     def test_unknown_ticker_raises(self, mock_data_dir: Path) -> None:
         """Unknown ticker should raise ValueError."""
@@ -311,12 +329,21 @@ class TestDataQuality:
         assert quality["missing_count"] == 0
         assert quality["completeness_pct"] == 100.0
 
+    def test_quality_includes_available_and_date_range(self, mock_data_dir: Path) -> None:
+        """Quality metrics should include available record count and observed date range."""
+        prices = historical_prices("AAPL", "2023-01-03", "2023-01-15", "yahoo")
+        quality = check_data_quality(data=prices)
+        assert quality["available_record_count"] == quality["total_values"] - quality["missing_count"]
+        assert quality["min_date"] is not None
+        assert quality["max_date"] is not None
+
     def test_linear_interpolation_fills_gaps(self, mock_data_dir: Path) -> None:
         """Linear interpolation should fill all NaN gaps."""
         prices = historical_prices("AAPL", "2023-01-03", "2023-01-15", "yahoo")
         filled = apply_gap_filling(prices, "linear_interpolation")
         assert filled["method"] == "linear_interpolation"
         assert filled["symbol"] == "AAPL"
+        assert filled["source"] == "yahoo"
         assert len(filled["dates"]) == len(prices["dates"])
         assert all(p is not None for p in filled["prices"])
 
@@ -380,8 +407,30 @@ class TestArtifacts:
         csv_path = Path(path)
         assert csv_path.exists()
         df = pd.read_csv(csv_path)
-        assert list(df.columns) == ["date", "price"]
+        assert list(df.columns) == ["date", "price", "source", "gap_filling_method"]
+        assert df["source"].iloc[0] == "yahoo"
+        assert df["gap_filling_method"].iloc[0] == "linear_interpolation"
         assert len(df) == len(filled["dates"])
+
+    def test_build_timeseries_prefers_filled_series_payload(self, mock_output_dir: Path) -> None:
+        """build_timeseries should persist the full filled population when both raw and filled fields exist."""
+        series = {
+            "symbol": "AAPL",
+            "source": "yahoo",
+            "method": "linear_interpolation",
+            "dates": ["2023-01-03", "2023-01-04"],
+            "prices": [150.0, 151.0],
+            "original_dates": ["2023-01-03", "2023-01-04"],
+            "original_prices": [150.0, None],
+            "filled_dates": ["2023-01-03", "2023-01-04", "2023-01-05", "2023-01-06"],
+            "filled_prices": [150.0, 150.5, 151.0, 151.5],
+        }
+        path = build_timeseries(series, filename="filled_population.csv", run_id="int_test")
+        csv_path = Path(path)
+        assert csv_path.exists()
+        df = pd.read_csv(csv_path)
+        assert len(df) == 4
+        assert list(df["price"]) == [150.0, 150.5, 151.0, 151.5]
 
     def test_generate_report_csv(self, mock_data_dir: Path, mock_output_dir: Path) -> None:
         """Quality report CSV should be created with correct columns."""
@@ -399,6 +448,15 @@ class TestArtifacts:
         prices = historical_prices("AAPL", "2023-01-03", "2024-12-30", "yahoo")
         filled = apply_gap_filling(prices, "linear_interpolation")
         path = visualize_timeseries(filled, title="AAPL 2023-2024", run_id="int_test")
+        png_path = Path(path)
+        assert png_path.exists()
+        assert png_path.suffix == ".png"
+
+    def test_visualize_timeseries_before_after_payload(self, mock_data_dir: Path, mock_output_dir: Path) -> None:
+        """Visualization should accept before/after payloads and persist a chart."""
+        prices = historical_prices("AAPL", "2023-01-03", "2024-12-30", "yahoo")
+        filled = apply_gap_filling(prices, "linear_interpolation")
+        path = visualize_timeseries(filled, title="AAPL before and after gap filling", run_id="int_test")
         png_path = Path(path)
         assert png_path.exists()
         assert png_path.suffix == ".png"
@@ -512,7 +570,13 @@ class TestFullWorkflow:
         assert quality_report.get("report_type") == "data_quality_summary"
         assert isinstance(quality_report.get("rows"), list)
         assert quality_report.get("rows")[0]["source"] == "yahoo"
+        assert quality_report.get("rows")[0].get("available_record_count") is not None
+        assert quality_report.get("rows")[0].get("min_date") is not None
+        assert quality_report.get("rows")[0].get("max_date") is not None
         assert "summary" in quality_report
+        assert quality_report["summary"].get("total_available_records") is not None
+        assert quality_report["summary"].get("min_date") is not None
+        assert quality_report["summary"].get("max_date") is not None
 
         # Should have an AWAITING_USER_INPUT event from ReportingAgent
         awaiting = [e for e in events if e.type == CallbackEventType.AWAITING_USER_INPUT]
@@ -779,6 +843,59 @@ class TestFullWorkflow:
             "Did not expect initial Orchestrator clarification pause"
         )
 
+
+    def test_construction_truncated_series_payload_is_recovered(
+        self,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """A truncated build_timeseries payload should be replaced with the full filled series from context."""
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Build the final artifact now.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\"], "
+                "\"prices\": [150.0, 150.5]}, \"filename\": \"final_timeseries.csv\", "
+                "\"run_id\": \"it_construction_truncated\"}"
+            ),
+            (
+                "Thought: Summarize final result for the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        mock_processor.handler.paused_state = {
+            "agent": "TimeSeriesConstructionAgent",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Build and persist the final time series for AAPL using linear_interpolation gap-filling. "
+                        "Filled data: {\"symbol\": \"AAPL\", \"method\": \"linear_interpolation\", "
+                        "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\", \"2023-01-06\"], "
+                        "\"prices\": [150.0, 150.5, 151.0, 151.5]}. "
+                        "Original request: Build AAPL from 2023-01-03 to 2023-01-31"
+                    ),
+                }
+            ],
+            "iteration": 0,
+        }
+
+        final_events = mock_processor.process_user_response("continue")
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in final_events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("TimeSeriesConstructionAgent", "ReportingAgent") in delegated_edges
+
+        output_file = mock_output_dir / "it_construction_truncated" / "final_timeseries.csv"
+        assert output_file.exists(), "Expected final output file to be persisted"
+        df = pd.read_csv(output_file)
+        assert len(df) == 4
+        assert list(df["price"]) == [150.0, 150.5, 151.0, 151.5]
     def test_explicit_agent_response_delegates_to_market_data(
         self,
         mock_data_dir: Path,
@@ -856,6 +973,10 @@ class TestFullWorkflow:
             "Final Answer: Instrument resolved from context.",
             # MarketDataAgent response for the auto-continuation
             "Final Answer: Market data retrieval started for AAPL.",
+            # DataQualityAgent response for the next auto-continuation
+            "Final Answer: Data quality checks completed for AAPL across all sources.",
+            # ReportingAgent response then pauses for source selection (no explicit choice)
+            "Final Answer: Quality comparison prepared. Please select one source to continue.",
         ]
 
         events = mock_processor.process_user_request("Build AAPL from 2023-01-01 to 2023-12-31")
@@ -1180,6 +1301,48 @@ class TestFullWorkflow:
         ]
         assert pauses and pauses[-1].payload.get("agent") == "ReportingAgent"
 
+    def test_data_quality_final_answer_fallback_computes_metrics(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """DataQuality fallback should compute metrics, not placeholder None values."""
+        mock_processor.factory.chat_sequence = [
+            "Final Answer: Instrument resolved successfully. Symbol: AAPL.",
+            "Final Answer: Historical prices for AAPL have been retrieved from yahoo, bloomberg, and reuters.",
+            "Final Answer: Data quality checks completed for AAPL across sources.",
+            "Final Answer: Quality comparison prepared. Please choose one source to continue.",
+        ]
+
+        events = mock_processor.process_user_request("Build AAPL from 2023-01-03 to 2023-01-31")
+
+        data_quality_event = next(
+            (
+                event
+                for event in events
+                if event.type == CallbackEventType.AGENT_COMPLETED
+                and event.payload.get("agent") == "DataQualityAgent"
+            ),
+            None,
+        )
+        assert data_quality_event is not None, "Expected DataQualityAgent completion event"
+
+        quality_report = data_quality_event.payload.get("result", {}).get("data_quality_report")
+        assert isinstance(quality_report, dict)
+        rows = quality_report.get("rows", [])
+        assert rows, "Expected quality report rows"
+
+        # Ensure deterministic fallback computed actual metrics.
+        for row in rows:
+            assert row.get("completeness_pct") is not None
+            assert row.get("available_record_count") is not None
+            assert row.get("min_date") is not None
+            assert row.get("max_date") is not None
+
+        summary = quality_report.get("summary", {})
+        assert summary.get("total_available_records") is not None
+        assert summary.get("average_completeness_pct") is not None
+
 
 # ---------------------------------------------------------------------------
 # Tests – handler and callback processor
@@ -1369,8 +1532,22 @@ class TestFrontToBackWorkflow:
                 "\"run_id\": \"it_full_flow\"}"
             ),
             (
-                "Thought: Finish and summarize result.\n"
-                "Final Answer: Continuous AAPL series generated at it_full_flow/final_timeseries.csv."
+                "Thought: Create final visualization artifact.\n"
+                "Action: visualize_timeseries\n"
+                "Action Input: {\"prices\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, 150.5, 151.0]}, \"title\": \"AAPL Continuous Series\", "
+                "\"run_id\": \"it_full_flow\"}"
+            ),
+            (
+                "Thought: Delegate to reporting for final summary.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"ReportingAgent\", "
+                "\"request\": \"summarize final artifacts for AAPL\"}"
+            ),
+            (
+                "Thought: Finish with a concise workflow summary.\n"
+                "Final Answer: Completed workflow for AAPL with CSV and chart artifacts generated."
             ),
         ]
 
@@ -1390,12 +1567,22 @@ class TestFrontToBackWorkflow:
         completed = [e for e in final_pass_events if e.type == CallbackEventType.AGENT_COMPLETED]
         completed_agents = {e.payload.get("agent") for e in completed}
         assert "TimeSeriesConstructionAgent" in completed_agents
+        assert "ReportingAgent" in completed_agents
+
+        delegated = [e for e in final_pass_events if e.type == CallbackEventType.DELEGATED]
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in delegated
+        }
+        assert ("TimeSeriesConstructionAgent", "ReportingAgent") in delegated_edges
 
         errors = [e for e in final_pass_events if e.type == CallbackEventType.ERROR]
         assert not errors, f"Unexpected errors in final pass: {errors}"
 
         output_file = mock_output_dir / "it_full_flow" / "final_timeseries.csv"
         assert output_file.exists(), "Expected final output file to be persisted"
+        chart_file = mock_output_dir / "it_full_flow" / "timeseries.png"
+        assert chart_file.exists(), "Expected final visualization file to be persisted"
 
     def test_user_exits_after_source_comparison(
         self,
@@ -1426,3 +1613,487 @@ class TestFrontToBackWorkflow:
         exit_errors = [e for e in exit_events if e.type == CallbackEventType.ERROR]
         assert exit_errors, "Expected cancellation event when user exits"
         assert "cancelled" in exit_errors[0].payload.get("message", "").lower()
+
+    def test_gapfilling_selected_method_does_not_repause(
+        self,
+        mock_data_dir: Path,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """GapFilling should not loop on request_human_input after user picks a method."""
+        mock_processor.factory.chat_sequence = [
+            # Looping model behavior: asks again even though user already selected.
+            (
+                "Thought: Please confirm your selected method again.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Please choose a gap-filling method\", \"options\": [\"linear_interpolation\", \"forward_fill\", \"backward_fill\", \"none\"]}"
+            ),
+            (
+                "Thought: Delegate to final series construction.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"TimeSeriesConstructionAgent\", \"request\": \"build final AAPL continuous series\"}"
+            ),
+            (
+                "Thought: Persist final series artifact.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", \"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], \"prices\": [150.0, 150.5, 151.0]}, \"filename\": \"final_timeseries.csv\", \"run_id\": \"it_gap_loop\"}"
+            ),
+            (
+                "Thought: Complete construction stage.\n"
+                "Final Answer: Constructed final AAPL time series artifact."
+            ),
+            (
+                "Thought: Provide final report to the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        # Resume directly at GapFilling pause to isolate loop behavior.
+        mock_processor.handler.paused_state = {
+            "agent": "GapFillingAgent",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "apply gap filling to yahoo AAPL. "
+                        "Original request: Build AAPL from 2023-01-03 to 2023-01-31"
+                    ),
+                }
+            ],
+            "iteration": 1,
+        }
+
+        final_events = mock_processor.process_user_response("1")
+        repause_events = [
+            e for e in final_events
+            if e.type == CallbackEventType.AWAITING_USER_INPUT
+            and e.payload.get("agent") == "GapFillingAgent"
+        ]
+        assert not repause_events, "GapFillingAgent should not re-pause after method selection"
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in final_events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("GapFillingAgent", "TimeSeriesConstructionAgent") in delegated_edges
+
+        completed_agents = {
+            e.payload.get("agent")
+            for e in final_events
+            if e.type == CallbackEventType.AGENT_COMPLETED
+        }
+        assert "TimeSeriesConstructionAgent" in completed_agents
+
+    def test_gapfilling_method_resume_auto_continues_to_construction(
+        self,
+        mock_data_dir: Path,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """Numeric method response at GapFilling pause should auto-continue.
+
+        Regression target: avoid reliance on an extra GapFilling LLM turn after
+        user method selection. Processor should apply method from context and
+        delegate directly to TimeSeriesConstructionAgent.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Persist final series artifact.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, 150.5, 151.0]}, \"filename\": \"final_timeseries.csv\", "
+                "\"run_id\": \"it_gap_resume_auto\"}"
+            ),
+            (
+                "Thought: Final series is generated.\n"
+                "Final Answer: Time series construction completed for AAPL."
+            ),
+            (
+                "Thought: Provide final report to the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        mock_processor.handler.paused_state = {
+            "agent": "GapFillingAgent",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "apply gap filling to yahoo AAPL. "
+                        "Original request: Build AAPL from 2023-01-03 to 2023-01-31"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Tool result: {\"symbol\": \"AAPL\", \"source\": \"yahoo\", "
+                        "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                        "\"prices\": [150.0, null, 151.0]}"
+                    ),
+                },
+            ],
+            "iteration": 1,
+            "checkpoint": "gap_method_selection",
+        }
+
+        final_events = mock_processor.process_user_response("1")
+
+        repause_events = [
+            e for e in final_events
+            if e.type == CallbackEventType.AWAITING_USER_INPUT
+            and e.payload.get("agent") == "GapFillingAgent"
+        ]
+        assert not repause_events, "GapFillingAgent should not re-pause after numeric method input"
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in final_events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("GapFillingAgent", "TimeSeriesConstructionAgent") in delegated_edges
+
+        completed_agents = {
+            e.payload.get("agent")
+            for e in final_events
+            if e.type == CallbackEventType.AGENT_COMPLETED
+        }
+        assert "TimeSeriesConstructionAgent" in completed_agents
+
+        output_file = mock_output_dir / "it_gap_resume_auto" / "final_timeseries.csv"
+        assert output_file.exists(), "Expected final output file to be persisted"
+
+    def test_construction_final_answer_auto_continues_to_reporting(
+        self,
+        mock_data_dir: Path,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """Construction narrative final answers should still delegate to ReportingAgent.
+
+        Regression: local models may stop at TimeSeriesConstructionAgent after
+        build_timeseries without calling visualize_timeseries or delegate_to_agent.
+        The processor must complete missing artifact generation and finish with
+        a final reporting summary.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Route this request to reference resolution.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"ReferenceDataAgent\", "
+                "\"request\": \"build AAPL from 2023-01-03 to 2023-01-31\"}"
+            ),
+            (
+                "Thought: Resolve instrument details first.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            (
+                "Thought: Delegate to market data collection.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"MarketDataAgent\", "
+                "\"request\": \"load AAPL from 2023-01-03 to 2023-01-31\"}"
+            ),
+            (
+                "Thought: Pull yahoo prices for the requested range.\n"
+                "Action: historical_prices\n"
+                "Action Input: {\"symbol\": \"AAPL\", \"start_date\": \"2023-01-03\", "
+                "\"end_date\": \"2023-01-31\", \"source\": \"yahoo\"}"
+            ),
+            (
+                "Thought: Pass prices to data quality agent.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"DataQualityAgent\", "
+                "\"request\": \"run quality checks for yahoo AAPL\"}"
+            ),
+            (
+                "Thought: Compute quality metrics.\n"
+                "Action: check_data_quality\n"
+                "Action Input: {\"prices\": [150.0, null, 151.0, 151.4], "
+                "\"source\": \"yahoo\", \"symbol\": \"AAPL\"}"
+            ),
+            (
+                "Thought: Ask reporting to present summary and collect source choice.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"ReportingAgent\", "
+                "\"request\": \"present source quality summary for AAPL\"}"
+            ),
+            (
+                "Thought: Pause for user source selection.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Choose preferred source for AAPL\", "
+                "\"options\": [\"yahoo\", \"bloomberg\", \"reuters\"]}"
+            ),
+            (
+                "Thought: User selected source, continue with gap filling.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"GapFillingAgent\", "
+                "\"request\": \"apply gap filling to yahoo AAPL\"}"
+            ),
+            (
+                "Thought: Ask user to choose a gap filling method.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Select gap filling method\", "
+                "\"options\": [\"linear_interpolation\", \"forward_fill\", \"backward_fill\"]}"
+            ),
+            (
+                "Thought: Apply chosen method before constructing final output.\n"
+                "Action: apply_gap_filling\n"
+                "Action Input: {\"prices\": {\"symbol\": \"AAPL\", \"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, null, 151.0]}, \"method\": \"linear_interpolation\"}"
+            ),
+            (
+                "Thought: Delegate to final series construction.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"TimeSeriesConstructionAgent\", "
+                "\"request\": \"build final AAPL continuous series\"}"
+            ),
+            (
+                "Thought: Persist final series artifact.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, 150.5, 151.0]}, \"filename\": \"final_timeseries.csv\", "
+                "\"run_id\": \"it_missing_visual\"}"
+            ),
+            (
+                "Thought: Final series is generated.\n"
+                "Final Answer: Time series construction completed for AAPL."
+            ),
+            (
+                "Thought: Summarize final result for the user.\n"
+                "Final Answer: Completed end-to-end workflow for AAPL with final CSV and chart artifacts."
+            ),
+            (
+                "Thought: Provide final report to the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        first_pass_events = mock_processor.process_user_request(
+            "Build AAPL from 2023-01-03 to 2023-01-31 and help me fill data gaps."
+        )
+        first_pause = [e for e in first_pass_events if e.type == CallbackEventType.AWAITING_USER_INPUT]
+        assert first_pause and first_pause[-1].payload["agent"] == "ReportingAgent"
+
+        second_pass_events = mock_processor.process_user_response("yahoo")
+        second_pause = [e for e in second_pass_events if e.type == CallbackEventType.AWAITING_USER_INPUT]
+        assert second_pause and second_pause[-1].payload["agent"] == "GapFillingAgent"
+
+        final_events = mock_processor.process_user_response("linear_interpolation")
+        completed = [e for e in final_events if e.type == CallbackEventType.AGENT_COMPLETED]
+        completed_agents = {e.payload.get("agent") for e in completed}
+        assert "TimeSeriesConstructionAgent" in completed_agents
+        assert "ReportingAgent" in completed_agents
+
+        delegated = [e for e in final_events if e.type == CallbackEventType.DELEGATED]
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in delegated
+        }
+        assert ("TimeSeriesConstructionAgent", "ReportingAgent") in delegated_edges
+
+        output_file = mock_output_dir / "it_missing_visual" / "final_timeseries.csv"
+        assert output_file.exists(), "Expected final output file to be persisted"
+
+        png_files = list(mock_output_dir.rglob("timeseries.png"))
+        assert png_files, "Expected visualization artifact to be persisted"
+
+        errors = [e for e in final_events if e.type == CallbackEventType.ERROR]
+        assert not errors, f"Unexpected errors in final pass: {errors}"
+
+    def test_construction_unparseable_action_input_still_continues(
+        self,
+        mock_data_dir: Path,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """Malformed TimeSeries action payload should not block final continuation.
+
+        Reproduces local-model behavior where build_timeseries Action Input is
+        truncated/invalid JSON. Processor should recover deterministically from
+        filled-data context, persist artifacts, and delegate to ReportingAgent.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Build the final artifact now.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, 150.5, 151.0]}, \"filename\": \"final_timeseries.csv\", "
+                "\"run_id\": \"it_construction_unparseable\""
+            ),
+            (
+                "Thought: Summarize final result for the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        mock_processor.handler.paused_state = {
+            "agent": "TimeSeriesConstructionAgent",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Build and persist the final time series for AAPL using linear_interpolation gap-filling. "
+                        "Filled data: {\"symbol\": \"AAPL\", \"method\": \"linear_interpolation\", "
+                        "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                        "\"prices\": [150.0, 150.5, 151.0]}. "
+                        "Original request: Build AAPL from 2023-01-03 to 2023-01-31"
+                    ),
+                }
+            ],
+            "iteration": 0,
+        }
+
+        final_events = mock_processor.process_user_response("continue")
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in final_events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("TimeSeriesConstructionAgent", "ReportingAgent") in delegated_edges
+
+        completed_agents = {
+            e.payload.get("agent")
+            for e in final_events
+            if e.type == CallbackEventType.AGENT_COMPLETED
+        }
+        assert "TimeSeriesConstructionAgent" in completed_agents
+        assert "ReportingAgent" in completed_agents
+
+        output_file = mock_output_dir / "default" / "final_timeseries.csv"
+        assert output_file.exists(), "Expected deterministic construction CSV artifact"
+        chart_file = mock_output_dir / "default" / "timeseries.png"
+        assert chart_file.exists(), "Expected deterministic construction chart artifact"
+
+    def test_gapfilling_final_answer_with_method_still_continues_to_construction(
+        self,
+        mock_data_dir: Path,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """GapFilling narrative completion with explicit method must not terminate flow.
+
+        Reproduces qwen behavior where GapFillingAgent returns a Final Answer
+        mentioning linear_interpolation without calling apply_gap_filling.
+        Processor should recover prices, apply gap-filling deterministically,
+        then continue to TimeSeriesConstructionAgent and final Reporting summary.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Route this request to reference resolution.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"ReferenceDataAgent\", "
+                "\"request\": \"build AAPL from 2023-01-03 to 2023-01-31\"}"
+            ),
+            (
+                "Thought: Resolve instrument details first.\n"
+                "Action: get_instrument_details\n"
+                "Action Input: {\"query\": \"AAPL\"}"
+            ),
+            (
+                "Thought: Delegate to market data collection.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"MarketDataAgent\", "
+                "\"request\": \"load AAPL from 2023-01-03 to 2023-01-31\"}"
+            ),
+            (
+                "Thought: Pull bloomberg prices for the requested range.\n"
+                "Action: historical_prices\n"
+                "Action Input: {\"symbol\": \"AAPL\", \"start_date\": \"2023-01-03\", "
+                "\"end_date\": \"2023-01-31\", \"source\": \"bloomberg\"}"
+            ),
+            (
+                "Thought: Pass prices to data quality agent.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"DataQualityAgent\", "
+                "\"request\": \"run quality checks for bloomberg AAPL\"}"
+            ),
+            (
+                "Thought: Compute quality metrics.\n"
+                "Action: check_data_quality\n"
+                "Action Input: {\"prices\": [150.0, null, 151.0, 151.4], "
+                "\"source\": \"bloomberg\", \"symbol\": \"AAPL\"}"
+            ),
+            (
+                "Thought: Ask reporting to present summary and collect source choice.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"ReportingAgent\", "
+                "\"request\": \"present source quality summary for AAPL\"}"
+            ),
+            (
+                "Thought: Pause for user source selection.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Choose preferred source for AAPL\", "
+                "\"options\": [\"yahoo\", \"bloomberg\", \"reuters\"]}"
+            ),
+            (
+                "Thought: Continue with gap filling.\n"
+                "Action: delegate_to_agent\n"
+                "Action Input: {\"agent_name\": \"GapFillingAgent\", "
+                "\"request\": \"apply gap filling to bloomberg AAPL. Original request: Build AAPL from 2023-01-03 to 2023-01-31 and help me fill data gaps.\"}"
+            ),
+            (
+                "Thought: Ask user to choose a gap filling method.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Select gap filling method\", "
+                "\"options\": [\"linear_interpolation\", \"forward_fill\", \"backward_fill\"]}"
+            ),
+            (
+                "Thought: Gap-filling applied using linear_interpolation to the AAPL instrument from Bloomberg.\n"
+                "Final Answer: Gap-filling applied using linear_interpolation to the AAPL instrument from Bloomberg."
+            ),
+            (
+                "Thought: Persist final series artifact.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, 150.5, 151.0]}, \"filename\": \"final_timeseries.csv\", "
+                "\"run_id\": \"it_gap_method_final\"}"
+            ),
+            (
+                "Thought: Summarize final result for the user.\n"
+                "Final Answer: Completed end-to-end workflow for AAPL with final CSV and chart artifacts."
+            ),
+            (
+                "Thought: Provide final report to the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        first_pass_events = mock_processor.process_user_request(
+            "Build AAPL from 2023-01-03 to 2023-01-31 and help me fill data gaps."
+        )
+        first_pause = [e for e in first_pass_events if e.type == CallbackEventType.AWAITING_USER_INPUT]
+        assert first_pause and first_pause[-1].payload["agent"] == "ReportingAgent"
+
+        second_pass_events = mock_processor.process_user_response("bloomberg")
+        second_pause = [e for e in second_pass_events if e.type == CallbackEventType.AWAITING_USER_INPUT]
+        assert second_pause and second_pause[-1].payload["agent"] == "GapFillingAgent"
+
+        final_events = mock_processor.process_user_response("linear_interpolation")
+        completed = [e for e in final_events if e.type == CallbackEventType.AGENT_COMPLETED]
+        completed_agents = {e.payload.get("agent") for e in completed}
+        assert "GapFillingAgent" in completed_agents
+        assert "TimeSeriesConstructionAgent" in completed_agents
+        assert "ReportingAgent" in completed_agents
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in final_events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("GapFillingAgent", "TimeSeriesConstructionAgent") in delegated_edges
+        assert ("TimeSeriesConstructionAgent", "ReportingAgent") in delegated_edges
+
+        output_file = mock_output_dir / "it_gap_method_final" / "final_timeseries.csv"
+        assert output_file.exists(), "Expected final output file to be persisted"
+        png_files = list(mock_output_dir.rglob("timeseries.png"))
+        assert png_files, "Expected visualization artifact to be persisted"
+
+        errors = [e for e in final_events if e.type == CallbackEventType.ERROR]
+        assert not errors, f"Unexpected errors in final pass: {errors}"
