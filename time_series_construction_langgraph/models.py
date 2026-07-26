@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LLMRequest:
-    model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "ollama/gemma4:26b"))
+    model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "ollama/llama3.2"))
     temperature: float = 0.1
     max_tokens: int = 2048
     system_prompt: str = ""
@@ -56,6 +56,20 @@ class ModelRequestFactory:
         except Exception:
             logger.exception("llm_request_failed model=%s", request.model)
             raise
+
+    def _get_model(self) -> Any:
+        """Return a LangChain chat model backed by LiteLLM.
+
+        Used by ``create_react_agent`` for native tool calling.
+        """
+        from langchain_community.chat_models import ChatLiteLLM
+
+        request = LLMRequest()
+        return ChatLiteLLM(
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+        )
 
     @classmethod
     def from_environment(cls) -> "ModelRequestFactory":

@@ -1,0 +1,51 @@
+adjust the code so different models can be used for various agents. Create a registry - dictionary agent name as key and model name. This should be default dictionary with default value. Create function in models.py to query provider for available models so if defined models per agent is not available a default is used. Take in suggestion for __Recommendation:__ Keep deepseek-v2:16b for MarketDataAgent and GapFillingAgent where reasoning matters. Use a smaller model (e.g. `ollama/qwen2.5:1.5b` at 2-4s per response) for Orchestrator and ReferenceDataAgent routing decisions. Create a factory to wire up agents  with corresponding models into workflow
+
+
+adjust the code so different models can be used for various agents. Create a registry - dictionary agent name as key and model name. This should be default dictionary with default value. Create function in models.py to query provider for available models so if defined models per agent is not available a default is used. Take in suggestion for __Recommendation:__ Keep deepseek-v2:16b for MarketDataAgent and GapFillingAgent where reasoning matters. Use a smaller model (e.g. `ollama/qwen2.5:1.5b` at 2-4s per response) for Orchestrator and ReferenceDataAgent routing decisions. Create a factory to wire up agents  with corresponding models into workflow
+
+
+for promopt 
+create time series for apple AAP betwnee 1 january 2023 and 1 january 2024
+
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.processor: request_received characters=74
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.handler: event=user_request agent=None
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.processor: workflow_started agent=Orchestrator
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.debug_logger: progress agent=Orchestrator iteration=0 status=started
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.processor: agent_started agent=Orchestrator iteration_start=0
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.debug_logger: progress agent=Orchestrator iteration=0 status=llm_call
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.processor: agent_iteration agent=Orchestrator iteration=0
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.debug_logger: message_size agent=Orchestrator iteration=0 messages=1 chars=74 estimated_tokens=18
+2026-07-25 17:56:14 [INFO] financial_time_series_construction.models: llm_request model=ollama/deepseek-v2:16b messages=1 callbacks=1
+17:56:14 - LiteLLM:INFO: utils.py:3831 - 
+LiteLLM completion() model= deepseek-v2:16b; provider = ollama
+2026-07-25 17:56:14 [INFO] LiteLLM: 
+LiteLLM completion() model= deepseek-v2:16b; provider = ollama
+18:00:59 - LiteLLM:INFO: utils.py:1478 - Wrapper: Completed Call, calling success_handler
+2026-07-25 18:00:59 [INFO] LiteLLM: Wrapper: Completed Call, calling success_handler
+2026-07-25 18:00:59 [INFO] financial_time_series_construction.models: llm_response model=ollama/deepseek-v2:16b characters=699
+2026-07-25 18:00:59 [WARNING] financial_time_series_construction.debug_logger: timer_slow agent=Orchestrator iteration=0 label=LLM call elapsed=285.73s
+2026-07-25 18:00:59 [INFO] financial_time_series_construction.processor: agent_completed agent=Orchestrator iteration=0
+2026-07-25 18:00:59 [INFO] financial_time_series_construction.handler: event=agent_completed agent=Orchestrator
+
+[REQUEST] create time series for apple AAP betwnee 1 january 2023 and 1 january 2024 i was promopt again instead of proceeding to market data agent
+
+[COMPLETE] Agent: Orchestrator
+Result: The user's request involves the creation of a time series for Apple Inc., between January 2023 and January 2024, which is within my area of expertise as a financial data construction agent. I will now proceed with creating this dataset based on the provided date range.
+
+LLM_MODEL="ollama/qwen2.5:1.5b" python -m financial_time_series_construction.cli \
+  --request "AAPL from 2023-01-01 to 2024-01-01"
+  
+LLM_MODEL="ollama/qwen2.5:1.5b" python -m cli --request "AAPL from 2023-01-01 to 2024-01-01"
+
+ollama/deepseek-v2:16b
+
+LLM_MODEL="ollama/deepseek-v2:16b" python -m financial_time_series_construction.cli \
+  --request "AAPL from 2023-01-01 to 2024-01-01"
+
+
+
+  Command executed:
+/opt/homebrew/anaconda3/envs/ai_engineering/bin/python -m pytest -q test_workflow_int.py -k "gapfilling_method_resume_auto_continues_to_construction or gapfilling_selected_method_does_not_repause or gapfilling_final_answer_with_method_still_continues_to_construction or quality_includes_available_and_date_range" test_cli_quality_render.py
+
+
+python -m financial_time_series_construction.cli --request "create time series Apple (AAPL) from 2024-01-02 to 2025-01-02" --provider ollama --model qwen2.5:1.5b --debug-flow

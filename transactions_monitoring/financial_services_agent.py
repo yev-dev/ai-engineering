@@ -12,7 +12,7 @@ from langchain.tools import tool
 from langgraph.graph import StateGraph
 
 
-MODEL_NAME = "deepseek-v2:16b"
+MODEL_NAME = "llama3.2"
 
 @tool
 def investigate_transaction(account_id: str = None, customer_id: str = None, alert_type: str = None, **kwargs) -> str:
@@ -133,7 +133,34 @@ graph = construct_graph()
 
 if __name__ == "__main__":
     example = {"account_id": "ACC123456", "customer_id": "CUST789", "balance": 5000.0}
-    convo = [HumanMessage(content="I think there's fraud on my account. I see a $2,500 charge in Miami but I'm in New York.")]
-    result = graph.invoke({"account": example, "messages": convo})
-    for m in result["messages"]:
-        print(f"{m.type}: {m.content}") 
+    cases = {
+        # "fraud_alert": {
+        #     "account": example,
+        #     "messages": [
+        #         HumanMessage(content="I think there's fraud on my account. I see a $2,500 charge in Miami but I'm in New York.")
+        #     ]
+        # },
+        "loan_request": {
+            "account": example,
+            "messages": [
+                HumanMessage(content="I want to apply for a personal loan of $10,000.")
+            ]
+        },
+        "dispute_charge": {
+            "account": example,
+            "messages": [
+                HumanMessage(content="I was charged twice for the same transaction. Please help me resolve this dispute.")
+            ]
+        }
+    }
+
+    for case_name, case_data in cases.items():
+        print(f"\n--- Running case: {case_name} ---")
+        result = graph.invoke(case_data)
+        for m in result["messages"]:
+            print(f"{m.type}: {m.content}")
+
+    # convo = [HumanMessage(content="I think there's fraud on my account. I see a $2,500 charge in Miami but I'm in New York.")]
+    # result = graph.invoke({"account": example, "messages": convo})
+    # for m in result["messages"]:
+    #     print(f"{m.type}: {m.content}") 

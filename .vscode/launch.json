@@ -14,73 +14,345 @@
             "console": "integratedTerminal",
             "justMyCode": false
         },
+        // {
+        //     "name": "Time Series: Autogen CLI",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "time_series.autogen_framework.cli",
+        //     "args": [
+        //         "--ticker", "AAPL",
+        //         "--start", "2024-01-01",
+        //         "--end", "2024-12-31",
+        //         "--yahoo-mode", "stub",
+        //         "--llm-client", "ollama",
+        //         "--llm-model", "gemma4"
+        //     ],
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true
+        // },
+        // {
+        //     "name": "Time Series: LangChain CLI",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "time_series.langchain_framework.cli",
+        //     "args": [
+        //         "--ticker", "AAPL",
+        //         "--start", "2024-01-01",
+        //         "--end", "2024-12-31",
+        //         "--yahoo-mode", "stub",
+        //         "--llm-client", "ollama",
+        //         "--llm-model", "gemma4",
+        //         // "--non-interactive", 
+        //     ],
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true
+        // },
+        // {
+        //     "name": "Time Series Construction: CLI",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "time_series_construction.cli",
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true,
+        //     "env": {
+        //         "LOG_LEVEL": "INFO"
+        //     }
+        // },
+        // {
+        //     "name": "Time Series Construction: pytest workflow",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "pytest",
+        //     "args": [
+        //         "time_series_construction/tests/test_workflow.py",
+        //         "-q"
+        //     ],
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true
+        // },
+        // {
+        //     "name": "Time Series Construction: pytest integration",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "pytest",
+        //     "args": [
+        //         "time_series_construction/tests/test_workflow_int.py",
+        //         "-v"
+        //     ],
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true
+        // },
         {
-            "name": "Time Series: Autogen CLI",
+            "name": "Financial Time Series Construction: CLI",
             "type": "debugpy",
             "request": "launch",
-            "module": "time_series.autogen_framework.cli",
-            "args": [
-                "--ticker", "AAPL",
-                "--start", "2024-01-01",
-                "--end", "2024-12-31",
-                "--yahoo-mode", "stub",
-                "--llm-client", "ollama",
-                "--llm-model", "gemma4"
-            ],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Time Series: LangChain CLI",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "time_series.langchain_framework.cli",
-            "args": [
-                "--ticker", "AAPL",
-                "--start", "2024-01-01",
-                "--end", "2024-12-31",
-                "--yahoo-mode", "stub",
-                "--llm-client", "ollama",
-                "--llm-model", "gemma4",
-                // "--non-interactive", 
-            ],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Time Series Construction: CLI",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "time_series_construction.cli",
+            "module": "financial_time_series_construction.cli",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "LOG_LEVEL": "INFO"
+                "LOG_LEVEL": "INFO",
+                "LLM_MODEL": "ollama/qwen2.5:1.5b"
             }
         },
         {
-            "name": "Time Series Construction: pytest workflow",
+            "name": "Financial Time Series Construction: pytest workflow",
             "type": "debugpy",
             "request": "launch",
             "module": "pytest",
             "args": [
-                "time_series_construction/tests/test_workflow.py",
+                "financial_time_series_construction/tests/test_workflow.py",
                 "-q"
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": true
         },
+        // {
+        //     "name": "Time Series Construction LangGraph: CLI",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "time_series_construction_langgraph.cli",
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true,
+        //     "env": {
+        //         "LOG_LEVEL": "INFO"
+        //     }
+        // },
+        // {
+        //     "name": "Time Series Construction LangGraph: pytest integration",
+        //     "type": "debugpy",
+        //     "request": "launch",
+        //     "module": "pytest",
+        //     "args": [
+        //         "time_series_construction_langgraph/tests/test_workflow_int.py",
+        //         "-v"
+        //     ],
+        //     "cwd": "${workspaceFolder}",
+        //     "console": "integratedTerminal",
+        //     "justMyCode": true
+        // },
         {
-            "name": "Time Series Construction: pytest integration",
+            "name": "Financial Time Series Construction: pytest integration (all)",
             "type": "debugpy",
             "request": "launch",
             "module": "pytest",
             "args": [
-                "time_series_construction/tests/test_workflow_int.py",
+                "financial_time_series_construction/tests/test_workflow_int.py",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: workflow completes for APL",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_completes_for_apl",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: resume completes reporting agent",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_resume_completes_reporting_agent",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: recovers from APEL typo",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_recovers_from_apel_typo",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: rejects environment command",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_rejects_environment_command",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: rejects non-financial request",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_rejects_non_financial_request",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: cancel during pause",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_cancel_during_pause",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: delegation events emitted",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_workflow_delegation_events_emitted",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: orchestrator clarification with dates progresses",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_orchestrator_clarification_with_dates_progresses",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: word dates bypass orchestrator pause",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_initial_request_with_word_dates_bypasses_orchestrator_pause",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: start/end labels bypass orchestrator pause",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_initial_request_with_start_end_labels_bypasses_orchestrator_pause",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: explicit agent response delegates to market data",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_explicit_agent_response_delegates_to_market_data",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: reference reask bypassed after instrument resolution",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_reference_reask_is_bypassed_after_instrument_resolution",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: recovers from bool symbol argument",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_reference_agent_recovers_from_bool_symbol_argument",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFullWorkflow: market data source selection final bypassed",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFullWorkflow::test_market_data_source_selection_final_is_bypassed",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFrontToBackWorkflow: full workflow with two human checkpoints",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFrontToBackWorkflow::test_full_workflow_with_two_human_checkpoints",
+                "-v"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "TestFrontToBackWorkflow: user exits after source comparison",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "financial_time_series_construction/tests/test_workflow_int.py::TestFrontToBackWorkflow::test_user_exits_after_source_comparison",
                 "-v"
             ],
             "cwd": "${workspaceFolder}",
