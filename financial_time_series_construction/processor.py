@@ -1176,6 +1176,37 @@ class TimeSeriesConstructionProcessor:
             # Check for response loop (identical response as previous iteration)
             loop_detector.record_response(agent.name, iteration, response)
 
+            if (
+                agent.name == "ReportingAgent"
+                and any(
+                    _REPORTING_FINAL_SUMMARY_NOTE in msg.get("content", "")
+                    for msg in messages
+                    if msg.get("role") == "user"
+                )
+            ):
+                summary_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response.strip()
+                self._log_continuation_decision(
+                    agent.name,
+                    iteration,
+                    "completed",
+                    "reporting_final_summary_terminal",
+                )
+                logger.info(
+                    "agent_completed agent=%s iteration=%d reason=reporting_final_summary_terminal",
+                    agent.name,
+                    iteration,
+                )
+                self.handler.emit(
+                    CallbackEvent(
+                        CallbackEventType.AGENT_COMPLETED,
+                        {
+                            "agent": agent.name,
+                            "result": {"final_answer": summary_text},
+                        },
+                    )
+                )
+                return self._drain()
+
             # Check for Final Answer, including models that emit "Action: Final Answer".
             if "Final Answer:" in response or re.search(r"Action:\s*Final\s+Answer\b", response, re.IGNORECASE):
                 if "Final Answer:" not in response and re.search(r"Action:\s*Final\s+Answer\b", response, re.IGNORECASE):
@@ -1292,6 +1323,29 @@ class TimeSeriesConstructionProcessor:
 
             if not calls:
                 unparseable_count += 1
+                if agent.name == "GapFillingAgent":
+                    deterministic_gap = self._continue_gapfilling_to_construction(
+                        response,
+                        agent,
+                        messages,
+                        iteration,
+                        visited,
+                    )
+                    if deterministic_gap is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail="gapfilling_recovered_after_unparseable_actions",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "pausing",
+                            "gapfilling_recovered_after_unparseable_actions",
+                        )
+                        return deterministic_gap
                 if agent.name == "TimeSeriesConstructionAgent":
                     deterministic_construction = self._continue_construction_to_reporting(
                         response,
@@ -2299,13 +2353,36 @@ class TimeSeriesConstructionProcessor:
             ),
         ]
 
-        target_result = self._run_agent(
-            gap_agent,
-            [{"role": "user", "content": transfer_request}],
-            visited=visited.copy(),
+        gap_method_options = self._extract_gap_method_options_from_messages(messages)
+        gap_method_prompt = self._build_gap_method_prompt(gap_method_options)
+        awaiting_event = CallbackEvent(
+            CallbackEventType.AWAITING_USER_INPUT,
+            {
+                "prompt": gap_method_prompt,
+                "agent": gap_agent.name,
+                "options": gap_method_options,
+                "context": {
+                    "checkpoint": "gap_method_selection",
+                    "selected_source": selected_source,
+                    "symbol": resolved_symbol,
+                },
+            },
+            self.handler.session_id,
         )
-
-        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+        self.handler.current_agent = gap_agent.name
+        self.handler.waiting_for_input = True
+        self.handler.paused_state = {
+            "agent": gap_agent.name,
+            "messages": messages.copy() + [{"role": "user", "content": f"[SOURCE_SELECTION] {selected_source}"}],
+            "iteration": iteration + 1,
+            "checkpoint": "gap_method_selection",
+        }
+        logger.info(
+            "gapfilling_method_pause mode=deterministic agent=%s options=%s reason=reporting_selected_source_requires_method_selection",
+            gap_agent.name,
+            gap_method_options,
+        )
+        return continuation_events + [awaiting_event]
 
     def _continue_gapfilling_to_construction(
         self,
@@ -3155,26 +3232,6 @@ class TimeSeriesConstructionProcessor:
                         merged_payload.get("symbol"),
                         merged_payload.get("method"),
                     )
-            self.handler.request_human_input(
-                args.get("prompt", "Please choose an option."),
-                args.get("options"),
-                args.get("context"),
-            )
-            self.handler.paused_state = {
-                "agent": agent.name,
-                "messages": messages.copy(),
-                "iteration": iteration + 1,
-                "checkpoint": "gap_method_selection",
-            }
-            logger.info("agent_paused agent=%s iteration=%d", agent.name, iteration)
-            self._debug_flow_event(
-                component="processor",
-                stage="pause",
-                agent=agent.name,
-                iteration=iteration,
-                detail=f"tool={name}",
-            )
-            return None
 
         if name == "delegate_to_agent":
             target_name = str(args.get("agent_name", "")).strip()
@@ -3224,6 +3281,14 @@ class TimeSeriesConstructionProcessor:
                     agent.name,
                     target.name,
                 )
+                if agent.name == "TimeSeriesConstructionAgent":
+                    # Construction can receive stale self-delegation actions when
+                    # upstream deterministic recovery skips intermediate LLM turns.
+                    # Treat as no-op and continue iterating within the same agent.
+                    return {
+                        "status": "skipped_self_delegation",
+                        "agent": agent.name,
+                    }
                 continuation = self._continue_after_agent_completion(
                     response="",
                     agent=agent,
@@ -3660,6 +3725,11 @@ class TimeSeriesConstructionProcessor:
     def _normalize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Accept common LLM aliases while keeping tool schemas explicit."""
         normalized = dict(args)
+        if tool_name == "request_human_input":
+            if "prompt" not in normalized and isinstance(normalized.get("message"), str):
+                normalized["prompt"] = normalized["message"]
+            if "options" not in normalized and isinstance(normalized.get("choices"), list):
+                normalized["options"] = normalized["choices"]
         if tool_name == "get_instrument_details":
             if "query" in normalized and not isinstance(normalized["query"], str):
                 normalized.pop("query", None)
@@ -3671,6 +3741,25 @@ class TimeSeriesConstructionProcessor:
         if tool_name == "delegate_to_agent":
             if "agent_name" not in normalized and "agent" in normalized:
                 normalized["agent_name"] = normalized["agent"]
+            if "agent_name" not in normalized and "delegate_to" in normalized:
+                normalized["agent_name"] = normalized["delegate_to"]
+            if "request" not in normalized and isinstance(normalized.get("input"), str):
+                normalized["request"] = normalized["input"]
+            if "request" not in normalized:
+                hints = {
+                    key: value
+                    for key, value in normalized.items()
+                    if key in {
+                        "instrument_symbol",
+                        "symbol",
+                        "source",
+                        "start_date",
+                        "end_date",
+                        "method",
+                    }
+                }
+                if hints:
+                    normalized["request"] = json.dumps(hints)
         if tool_name == "historical_prices":
             if "symbol" not in normalized and "ticker" in normalized:
                 normalized["symbol"] = normalized["ticker"]
@@ -3878,10 +3967,11 @@ class TimeSeriesConstructionProcessor:
         4. Loose JSON: any top-level JSON object with ``name`` and ``arguments`` keys
         """
         calls: list[dict[str, Any]] = []
+        cleaned_text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
 
         # Strategy 1: Strict single-line ReACT format
         action_matches = list(
-            re.finditer(r"Action:\s*([A-Za-z_]\w*)\s+Action Input:\s*", text)
+            re.finditer(r"Action:\s*([A-Za-z_]\w*)\s+Action Input:\s*", cleaned_text)
         )
         for index, match in enumerate(action_matches):
             name = match.group(1)
@@ -3889,9 +3979,9 @@ class TimeSeriesConstructionProcessor:
             input_end = (
                 action_matches[index + 1].start()
                 if index + 1 < len(action_matches)
-                else len(text)
+                else len(cleaned_text)
             )
-            raw_input = text[input_start:input_end].strip()
+            raw_input = cleaned_text[input_start:input_end].strip()
             raw_input = re.sub(
                 r"^```(?:json|python)?\s*|\s*```$",
                 "",
@@ -3911,7 +4001,7 @@ class TimeSeriesConstructionProcessor:
         multi_line_matches = list(
             re.finditer(
                 r"Action:\s*([A-Za-z_]\w*)\s*\n\s*Action Input:\s*",
-                text,
+                cleaned_text,
                 re.MULTILINE,
             )
         )
@@ -3921,9 +4011,9 @@ class TimeSeriesConstructionProcessor:
             input_end = (
                 multi_line_matches[index + 1].start()
                 if index + 1 < len(multi_line_matches)
-                else len(text)
+                else len(cleaned_text)
             )
-            raw_input = text[input_start:input_end].strip()
+            raw_input = cleaned_text[input_start:input_end].strip()
             raw_input = re.sub(
                 r"^```(?:json|python)?\s*|\s*```$",
                 "",
@@ -3943,14 +4033,14 @@ class TimeSeriesConstructionProcessor:
         code_fence_matches = list(
             re.finditer(
                 r"```(?:json)?\s*\n?\s*\{\s*\"name\"\s*:\s*\"([A-Za-z_]\w*)\"",
-                text,
+                cleaned_text,
             )
         )
         if code_fence_matches:
             for match in code_fence_matches:
                 name = match.group(1)
                 # Find the closing fence
-                remaining = text[match.start():]
+                remaining = cleaned_text[match.start():]
                 close_fence = remaining.find("```", 6)
                 json_block = remaining[:close_fence] if close_fence > 0 else remaining
                 json_block = re.sub(
@@ -3969,11 +4059,18 @@ class TimeSeriesConstructionProcessor:
         # Strategy 4: Loose JSON - find any JSON object with name/arguments keys
         json_decoder = json.JSONDecoder()
         search_start = 0
-        while search_start < len(text):
+        while search_start < len(cleaned_text):
             try:
-                parsed, end_pos = json_decoder.raw_decode(text, search_start)
+                parsed, end_pos = json_decoder.raw_decode(cleaned_text, search_start)
                 if isinstance(parsed, dict) and parsed.get("name") and isinstance(parsed.get("arguments"), dict):
                     calls.append({"name": str(parsed["name"]), "arguments": parsed["arguments"]})
+                elif isinstance(parsed, dict) and parsed.get("action"):
+                    action_name = str(parsed.get("action", "")).strip()
+                    if action_name:
+                        action_input = parsed.get("input", {})
+                        if not isinstance(action_input, dict):
+                            action_input = {"value": action_input}
+                        calls.append({"name": action_name, "arguments": action_input})
                 search_start = end_pos + 1
             except json.JSONDecodeError:
                 search_start += 1
