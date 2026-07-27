@@ -1477,6 +1477,9 @@ class TestHandler:
         assert len(records) == 2
         assert records[0]["type"] == "llm_response"
         assert records[1]["payload"]["tool"] == "check_data_quality"
+        trace_text = handler.get_trace()
+        assert '"type": "llm_response"' in trace_text
+        assert '"type": "tool_call"' in trace_text
 
     def test_callback_processor(self) -> None:
         """CallbackProcessor should dispatch events to multiple handlers."""
@@ -1681,6 +1684,74 @@ class TestFrontToBackWorkflow:
         assert exit_errors, "Expected cancellation event when user exits"
         assert "cancelled" in exit_errors[0].payload.get("message", "").lower()
 
+    def test_dataquality_malformed_check_payload_recovers_to_reporting_pause(
+        self,
+        mock_data_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """Malformed check_data_quality args should recover without hard error.
+
+        Regression target: stronger models may emit check_data_quality with
+        instrument_symbol/sources but without prices or data payload.
+        Processor should recover from prior historical_prices tool results,
+        continue to ReportingAgent, and pause for source selection.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Compute quality metrics for all sources.\n"
+                "Action: check_data_quality\n"
+                "Action Input: {\"instrument_symbol\": \"AAPL\", \"sources\": [\"yahoo\", \"bloomberg\", \"reuters\"], "
+                "\"start_date\": \"2023-01-03\", \"end_date\": \"2023-01-31\"}"
+            ),
+            (
+                "Thought: Ask user to select preferred source.\n"
+                "Action: request_human_input\n"
+                "Action Input: {\"prompt\": \"Choose preferred source for AAPL\", "
+                "\"options\": [\"yahoo\", \"bloomberg\", \"reuters\"]}"
+            ),
+        ]
+
+        mock_processor.handler.paused_state = {
+            "agent": "DataQualityAgent",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "run quality checks for AAPL across all sources. "
+                        "Original request: Build AAPL from 2023-01-03 to 2023-01-31"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Tool result: {\"symbol\": \"AAPL\", \"source\": \"yahoo\", "
+                        "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                        "\"prices\": [150.0, null, 151.0]}"
+                    ),
+                },
+            ],
+            "iteration": 0,
+        }
+
+        events = mock_processor.process_user_response("continue")
+
+        errors = [e for e in events if e.type == CallbackEventType.ERROR]
+        assert not errors, f"Unexpected errors during malformed payload recovery: {errors}"
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("DataQualityAgent", "ReportingAgent") in delegated_edges
+
+        pauses = [
+            e for e in events
+            if e.type == CallbackEventType.AWAITING_USER_INPUT
+            and e.payload.get("agent") == "ReportingAgent"
+        ]
+        assert pauses, "Expected source-selection pause from ReportingAgent"
+
     def test_gapfilling_selected_method_does_not_repause(
         self,
         mock_data_dir: Path,
@@ -1830,6 +1901,83 @@ class TestFrontToBackWorkflow:
         assert "TimeSeriesConstructionAgent" in completed_agents
 
         output_file = mock_output_dir / "it_gap_resume_auto" / "final_timeseries.csv"
+        assert output_file.exists(), "Expected final output file to be persisted"
+
+    def test_gapfilling_resume_uses_source_selection_marker_and_skips_repause(
+        self,
+        mock_data_dir: Path,
+        mock_output_dir: Path,
+        mock_processor: TimeSeriesConstructionProcessor,
+    ) -> None:
+        """Method-selected resumes should use [SOURCE_SELECTION] marker for source recovery.
+
+        Regression target: when quality context lists multiple sources, source
+        extraction from free-form text may fail and trigger GapFilling re-pause.
+        The explicit [SOURCE_SELECTION] marker must drive deterministic recovery
+        and continue directly to construction/reporting.
+        """
+        mock_processor.factory.chat_sequence = [
+            (
+                "Thought: Persist final series artifact.\n"
+                "Action: build_timeseries\n"
+                "Action Input: {\"series\": {\"symbol\": \"AAPL\", "
+                "\"dates\": [\"2023-01-03\", \"2023-01-04\", \"2023-01-05\"], "
+                "\"prices\": [150.0, 150.5, 151.0]}, \"filename\": \"final_timeseries.csv\", "
+                "\"run_id\": \"it_gap_marker_resume\"}"
+            ),
+            (
+                "Thought: Final series is generated.\n"
+                "Final Answer: Time series construction completed for AAPL."
+            ),
+            (
+                "Thought: Provide final report to the user.\n"
+                "Final Answer: Final summary complete with constructed CSV and visualization artifacts."
+            ),
+        ]
+
+        mock_processor.handler.paused_state = {
+            "agent": "GapFillingAgent",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Apply gap filling for AAPL. Quality comparison includes yahoo, bloomberg, reuters. "
+                        "Original request: Build AAPL from 2023-01-03 to 2023-01-31"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": "[SOURCE_SELECTION] bloomberg",
+                },
+            ],
+            "iteration": 2,
+            "checkpoint": "gap_method_selection",
+        }
+
+        final_events = mock_processor.process_user_response("1")
+
+        repause_events = [
+            e for e in final_events
+            if e.type == CallbackEventType.AWAITING_USER_INPUT
+            and e.payload.get("agent") == "GapFillingAgent"
+        ]
+        assert not repause_events, "GapFillingAgent should not re-pause after method selection"
+
+        delegated_edges = {
+            (e.payload.get("from_agent"), e.payload.get("to_agent"))
+            for e in final_events
+            if e.type == CallbackEventType.DELEGATED
+        }
+        assert ("GapFillingAgent", "TimeSeriesConstructionAgent") in delegated_edges
+
+        completed_agents = {
+            e.payload.get("agent")
+            for e in final_events
+            if e.type == CallbackEventType.AGENT_COMPLETED
+        }
+        assert "TimeSeriesConstructionAgent" in completed_agents
+
+        output_file = mock_output_dir / "it_gap_marker_resume" / "final_timeseries.csv"
         assert output_file.exists(), "Expected final output file to be persisted"
 
     def test_construction_final_answer_auto_continues_to_reporting(

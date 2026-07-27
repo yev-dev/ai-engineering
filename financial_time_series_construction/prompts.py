@@ -11,7 +11,18 @@ from financial_time_series_construction.agents_definition import Agent
 _LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("LLM_OLLAMA_MODEL", "")).casefold()
 _IS_LARGE_MODEL = any(
     tag in _LLM_MODEL
-    for tag in ("deepseek", "qwen2.5:7", "qwen2.5:14", "qwen2.5:32", "qwen2.5:72", "llama3", "gpt-4", "gemma")
+    for tag in (
+        "deepseek",
+        "qwen3",
+        "qwen3.5",
+        "qwen2.5:7",
+        "qwen2.5:14",
+        "qwen2.5:32",
+        "qwen2.5:72",
+        "llama3",
+        "gpt-4",
+        "gemma",
+    )
 )
 _IS_SMALL_MODEL = any(
     tag in _LLM_MODEL
@@ -46,8 +57,12 @@ Final Answer: <concise user-facing result>
 CRITICAL RULES:
 - Every response MUST contain either an Action/Action Input block OR a Final Answer.
 - Do NOT describe what you will do - just do it.
+- Use exactly one Action per response.
 - Do NOT use markdown code fences around Action Input JSON.
+- Do NOT output XML-like tags (for example </think> or <analysis>).
 - Do NOT add conversational text before or after the protocol.
+- If a tool just returned successfully, do not call the same tool again with equivalent inputs.
+- Use only tool names from Available tools (exact spelling).
 - Never invent tool results. If a tool reports an error, explain it to the user
   and stop or ask for the missing information.
 """
