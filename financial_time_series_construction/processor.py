@@ -22,7 +22,11 @@ from financial_time_series_construction.tools import (
     get_tool,
     get_tool_description,
     normalize_date_range,
+    set_run_id,
+    _get_data_store,
 )
+from financial_time_series_construction.tool_models import validate_tool_input
+
 from financial_time_series_construction.prompts import (
     agent_system_prompt,
     request_prompt,
@@ -429,7 +433,9 @@ class TimeSeriesConstructionProcessor:
                 agent=agent.name,
                 iteration=iteration,
             )
-            messages.append({"role": "user", "content": f"Tool result: {json.dumps(result, default=str)}"})
+            # Strip full payload from LLM-visible message to avoid token bloat
+            llm_result = TimeSeriesConstructionProcessor._strip_payload_for_llm(result)
+            messages.append({"role": "user", "content": f"Tool result: {json.dumps(llm_result, default=str)}"})
 
             if isinstance(result, dict) and result.get("source") and result.get("dates"):
                 loaded.add(source_key)
@@ -1154,6 +1160,8 @@ class TimeSeriesConstructionProcessor:
         visited.add(agent.name)
 
         self.handler.current_agent = agent.name
+        # Inject run_id so tools can store/load time series via DataStore
+        set_run_id(self.handler.session_id)
         prompt = self._prompt(agent)
         loop_detector = LoopDetector(max_repeats=3)
         unparseable_count = 0
@@ -3864,7 +3872,9 @@ class TimeSeriesConstructionProcessor:
             failure = self._tool_failure(name, result)
             if failure:
                 return [failure]
-            return result
+            # Strip large payloads from results that have a data_ref to avoid
+            # sending full time series data to the LLM (token cost optimization).
+            return self._strip_payload_for_llm(result)
         except Exception as error:
             if name == "check_data_quality" and agent.name == "DataQualityAgent":
                 continuation = self._continue_quality_to_reporting(
@@ -3928,6 +3938,37 @@ class TimeSeriesConstructionProcessor:
                 iteration=iteration,
             )
             return [self._user_error(name, str(error))]
+
+    @staticmethod
+    def _strip_payload_for_llm(result: Any) -> Any:
+        """Strip large payloads from tool results before sending to LLM.
+
+        When a tool result contains a ``data_ref`` (meaning the full data is
+        stored in the DataStore), the following large arrays are removed from
+        the payload sent to the LLM to prevent token bloat:
+
+        - ``dates``, ``prices`` (from historical_prices)
+        - ``filled_dates``, ``filled_prices``, ``original_dates``, ``original_prices`` (from apply_gap_filling)
+
+        The LLM still receives the ``data_ref`` which it can pass to downstream
+        tools to load the full data on demand.
+
+        Args:
+            result: The raw tool result (dict or other).
+
+        Returns:
+            The result with large arrays stripped if ``data_ref`` is present.
+        """
+        if isinstance(result, dict) and result.get("data_ref"):
+            stripped = dict(result)
+            stripped.pop("dates", None)
+            stripped.pop("prices", None)
+            stripped.pop("filled_dates", None)
+            stripped.pop("filled_prices", None)
+            stripped.pop("original_dates", None)
+            stripped.pop("original_prices", None)
+            return stripped
+        return result
 
     @staticmethod
     def _normalize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4042,6 +4083,9 @@ class TimeSeriesConstructionProcessor:
             if "data" not in normalized and "source" in normalized and "prices" not in normalized:
                 # LLM passed source but not prices/symbol - likely a malformed call
                 pass
+            # Support data_ref: if provided, downstream tool will load from DataStore
+            if "data_ref" in normalized and not isinstance(normalized["data_ref"], str):
+                normalized.pop("data_ref", None)
         if tool_name == "build_timeseries":
             if "series" not in normalized and isinstance(normalized.get("prices"), list) and isinstance(normalized.get("dates"), list):
                 normalized["series"] = {

@@ -11,6 +11,12 @@ from typing import Any
 import pandas as pd
 
 from financial_time_series_construction.agents_definition import CallbackEventType
+from financial_time_series_construction.time_series_construction import (
+    DataStore,
+    get_datastore,
+    init_datastore,
+    reset_datastore,
+)
 from financial_time_series_construction.models import ModelRequestFactory
 from financial_time_series_construction.prompt_library import (
     format_prompt_menu,
@@ -155,7 +161,7 @@ def _save_artifacts(
     runtime: AgenticRuntime,
     run_id: str,
 ) -> None:
-    """Save workflow artifacts: trace, events log."""
+    """Save workflow artifacts: trace, events log, and DataStore records."""
     output_root = Path(os.getenv(
         "TIME_SERIES_OUTPUT_DIR",
         Path.home() / "time_series_construction",
@@ -163,14 +169,36 @@ def _save_artifacts(
     run_dir = output_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # Initialize DataStore for artifact recording (singleton)
+    try:
+        datastore = get_datastore()
+    except RuntimeError:
+        try:
+            datastore = init_datastore(
+                output_root / "time_series_database" / "database" / "datastore.db"
+            )
+        except Exception as error:
+            logger.warning("Could not initialize DataStore: %s", error)
+            datastore = None
+
     # Save ReACT trace
     trace_path = run_dir / "react_trace.txt"
     trace_path.write_text(runtime.get_trace())
     logger.info("Trace saved to %s", trace_path)
+    if datastore is not None:
+        try:
+            datastore.put_artifact(run_id, "report", str(trace_path))
+        except Exception as error:
+            logger.debug("artifact_store_failed path=%s error=%s", trace_path, error)
 
     trace_json_path = run_dir / "react_trace.json"
     trace_json_path.write_text(json.dumps(_json_safe(runtime.get_trace_records()), indent=2))
     logger.info("Structured trace saved to %s", trace_json_path)
+    if datastore is not None:
+        try:
+            datastore.put_artifact(run_id, "report", str(trace_json_path))
+        except Exception as error:
+            logger.debug("artifact_store_failed path=%s error=%s", trace_json_path, error)
 
     # Save events log
     events_path = run_dir / "events.json"
@@ -184,6 +212,11 @@ def _save_artifacts(
     ]
     events_path.write_text(json.dumps(events_data, indent=2))
     logger.info("Events saved to %s", events_path)
+    if datastore is not None:
+        try:
+            datastore.put_artifact(run_id, "report", str(events_path))
+        except Exception as error:
+            logger.debug("artifact_store_failed path=%s error=%s", events_path, error)
 
     # Save workflow report and optional validation results.
     validation_rules: dict[str, Any] | None = None
@@ -200,14 +233,29 @@ def _save_artifacts(
     report_json_path = run_dir / "workflow_report.json"
     report_json_path.write_text(json.dumps(workflow_report, indent=2))
     logger.info("Workflow report saved to %s", report_json_path)
+    if datastore is not None:
+        try:
+            datastore.put_artifact(run_id, "report", str(report_json_path))
+        except Exception as error:
+            logger.debug("artifact_store_failed path=%s error=%s", report_json_path, error)
 
     report_text_path = run_dir / "workflow_report.txt"
     report_text_path.write_text(format_workflow_report(workflow_report))
     logger.info("Workflow report text saved to %s", report_text_path)
+    if datastore is not None:
+        try:
+            datastore.put_artifact(run_id, "report", str(report_text_path))
+        except Exception as error:
+            logger.debug("artifact_store_failed path=%s error=%s", report_text_path, error)
 
     quality_csv_path = _save_data_quality_summary_csv(events, run_dir)
     if quality_csv_path is not None:
         logger.info("Data quality summary CSV saved to %s", quality_csv_path)
+        if datastore is not None:
+            try:
+                datastore.put_artifact(run_id, "csv", str(quality_csv_path))
+            except Exception as error:
+                logger.debug("artifact_store_failed path=%s error=%s", quality_csv_path, error)
 
 
 def _print_events(events: list[Any]) -> None:
