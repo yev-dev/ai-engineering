@@ -32,7 +32,7 @@ from financial_time_series_construction.prompts import (
     request_prompt,
     unavailable_message,
 )
-from financial_time_series_construction.debug_logger import (
+from financial_time_series_construction.logger import (
     LoopDetector,
     log_message_size,
     log_workflow_progress,
@@ -145,6 +145,10 @@ class TimeSeriesConstructionProcessor:
                 )
             ]
 
+        # Record run metadata (run_id, start_date, end_date) in the database
+        # when the workflow starts with a valid request.
+        self._record_run_metadata(user_input)
+
         direct_events = self._try_direct_delegate_from_request(user_input)
         if direct_events is not None:
             return direct_events
@@ -157,6 +161,42 @@ class TimeSeriesConstructionProcessor:
             get_agent("Orchestrator"),
             [{"role": "user", "content": user_input}],
         )
+
+    def _record_run_metadata(self, user_input: str) -> None:
+        """Record run id, start_date and end_date in the runs table.
+
+        Extracts the date range from the user request and persists it in the
+        DataStore's ``runs`` table for the current session/run.
+
+        Args:
+            user_input: The user's natural language request.
+        """
+        run_id = self.handler.session_id
+        start_date: str | None = None
+        end_date: str | None = None
+        try:
+            extracted = extract_date_range(user_input)
+            if extracted is not None:
+                start_date, end_date = extracted
+        except ValueError:
+            logger.debug("run_metadata_date_parse_failed run_id=%s", run_id)
+
+        try:
+            set_run_id(run_id)
+            _get_data_store().put_run_metadata(
+                run_id=run_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            logger.info(
+                "run_metadata_recorded run_id=%s start_date=%s end_date=%s",
+                run_id, start_date, end_date,
+            )
+        except Exception as error:
+            logger.warning(
+                "run_metadata_store_failed run_id=%s error=%s",
+                run_id, error,
+            )
 
     def _try_direct_delegate_from_request(self, user_input: str) -> list[CallbackEvent] | None:
         """Deterministically delegate when request already includes instrument + date range.
@@ -946,9 +986,12 @@ class TimeSeriesConstructionProcessor:
             filled_result.get("symbol"),
         )
 
+        # Strip the full filled series payload from the LLM-visible message.
+        # The data_ref is sufficient for downstream tools to load from the DataStore.
+        llm_filled_result = TimeSeriesConstructionProcessor._strip_payload_for_llm(filled_result)
         resumed_messages = base_messages + [
             {"role": "user", "content": user_input},
-            {"role": "user", "content": f"Tool result: {json.dumps(filled_result, default=str)}"},
+            {"role": "user", "content": f"Tool result: {json.dumps(llm_filled_result, default=str)}"},
         ]
         continuation = self._continue_gapfilling_to_construction(
             response=f"Final Answer: Gap-filling applied with {selected_method}.",
@@ -1082,6 +1125,25 @@ class TimeSeriesConstructionProcessor:
             return None
 
         start_date, end_date = normalized_range
+        # Update run metadata when the date range becomes known after a
+        # clarification pause.
+        try:
+            set_run_id(self.handler.session_id)
+            _get_data_store().put_run_metadata(
+                run_id=self.handler.session_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            logger.info(
+                "run_metadata_updated run_id=%s start_date=%s end_date=%s",
+                self.handler.session_id, start_date, end_date,
+            )
+        except Exception as error:
+            logger.warning(
+                "run_metadata_update_failed run_id=%s error=%s",
+                self.handler.session_id, error,
+            )
+
         request = f"{combined_user_context} (normalized date range: {start_date} to {end_date})"
         logger.info(
             "orchestrator_auto_progress_detected mode=deterministic start=%s end=%s reason=user_followup_contains_date_range",
@@ -1481,11 +1543,7 @@ class TimeSeriesConstructionProcessor:
                 if recovery is not None:
                     return recovery
                 if unparseable_count >= 3:
-                    format_override = (
-                        "[SYSTEM_NOTE] FORMAT_OVERRIDE: Output exactly this format without any additional text:\n"
-                        "Action: get_instrument_details\n"
-                        "Action Input: {\"query\": \"AAPL\"}"
-                    )
+                    format_override = self._build_agent_format_override(agent.name)
                     messages.append({"role": "user", "content": format_override})
                     logger.warning(
                         "format_override_injected agent=%s iteration=%d reason=unparseable_count_exceeded",
@@ -1512,6 +1570,11 @@ class TimeSeriesConstructionProcessor:
                     agent=agent.name,
                     iteration=iteration,
                 )
+
+            # Reset the unparseable counter when the model produces valid tool
+            # calls. This prevents the format_override from being re-injected
+            # after the model has recovered and is producing parseable output.
+            unparseable_count = 0
 
             # Execute each tool call
             for call in calls:
@@ -1597,6 +1660,47 @@ class TimeSeriesConstructionProcessor:
                             f"quality_recovered_after_off_contract_{call['name']}",
                         )
                         return quality_continuation
+
+                if agent.name == "TimeSeriesConstructionAgent" and call["name"] in {
+                    "get_instrument_details",
+                    "available_data_sources",
+                    "historical_prices",
+                    "check_data_quality",
+                    "extract_requested_date_range",
+                    "normalize_requested_dates",
+                    "recommend_gap_methods",
+                    "apply_gap_filling",
+                    "request_human_input",
+                    "generate_report",
+                }:
+                    logger.warning(
+                        "off_contract_tool_recovered mode=deterministic agent=%s iteration=%d tool=%s",
+                        agent.name,
+                        iteration,
+                        call["name"],
+                    )
+                    construction_continuation = self._continue_construction_to_reporting(
+                        response="",
+                        agent=agent,
+                        messages=messages,
+                        iteration=iteration,
+                        visited=visited,
+                    )
+                    if construction_continuation is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail=f"construction_recovered_after_off_contract_{call['name']}",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            f"construction_recovered_after_off_contract_{call['name']}",
+                        )
+                        return construction_continuation
 
                 log_workflow_progress(
                     agent.name,
@@ -2556,14 +2660,15 @@ class TimeSeriesConstructionProcessor:
         Checks if a gap-filling method was applied by looking for apply_gap_filling
         tool results in the conversation.
         """
-        # Look for gap-filling results in tool results
+        # Look for gap-filling results in tool results (data_ref + metadata,
+        # since the full filled series is stored in the DataStore).
         filled_data = None
         final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
                 try:
                     tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
-                    if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("prices"):
+                    if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("data_ref"):
                         filled_data = tool_result
                         break
                 except (json.JSONDecodeError, KeyError):
@@ -2673,10 +2778,20 @@ class TimeSeriesConstructionProcessor:
         original_match = re.search(r"original_request=(.+)", all_user_text)
         original_request = original_match.group(1).strip() if original_match else all_user_text
 
+        # Pass only data_ref and metadata – never the full filled series payload.
+        # The TimeSeriesConstructionAgent loads the full series from the DataStore
+        # via build_timeseries/visualize_timeseries using the data_ref.
+        filled_ref = filled_data.get("data_ref")
+        filled_meta = {
+            "data_ref": filled_ref,
+            "symbol": filled_data.get("symbol"),
+            "source": filled_data.get("source"),
+            "method": filled_data.get("method"),
+        }
         transfer_request = (
             f"Build and persist the final time series for {filled_data.get('symbol', 'the instrument')} "
             f"using {filled_data.get('method', 'the selected')} gap-filling method. "
-            f"Filled data: {json.dumps(filled_data)}. "
+            f"Filled data: {json.dumps(filled_meta)}. "
             f"Original request: {original_request}"
         )
 
@@ -2722,7 +2837,12 @@ class TimeSeriesConstructionProcessor:
 
     @staticmethod
     def _extract_prices_payload_from_messages(messages: list[dict[str, str]]) -> dict[str, Any] | None:
-        """Extract a price series payload (dates/prices/symbol) from conversation context."""
+        """Extract a price series reference (data_ref + metadata) from conversation context.
+
+        Returns a compact dict with ``data_ref``, ``symbol``, ``source``, and
+        summary metadata – never the full dates/prices arrays.  The full series
+        is loaded from the DataStore on demand by downstream tools.
+        """
         for message in messages:
             if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
                 continue
@@ -2732,8 +2852,13 @@ class TimeSeriesConstructionProcessor:
                 continue
             if not isinstance(parsed, dict):
                 continue
-            if parsed.get("dates") and parsed.get("prices") and parsed.get("symbol"):
-                return parsed
+            if parsed.get("data_ref") and parsed.get("symbol"):
+                return {
+                    "data_ref": parsed["data_ref"],
+                    "symbol": parsed.get("symbol"),
+                    "source": parsed.get("source"),
+                    "summary": parsed.get("summary"),
+                }
         return None
 
     def _recover_gapfilling_prices_from_context(
@@ -2744,11 +2869,30 @@ class TimeSeriesConstructionProcessor:
         """Recover missing prices for deterministic gap-filling continuation.
 
         Priority:
-        1) Existing tool result payload in current context.
+        1) Existing tool result data_ref in current context (loads from DataStore).
         2) Deterministic historical_prices retrieval from symbol/source/date range.
         """
         direct_payload = self._extract_prices_payload_from_messages(messages)
         if direct_payload is not None:
+            # If we have a data_ref, load the full series from the DataStore
+            # so the apply_gap_filling tool can operate on it.
+            data_ref = direct_payload.get("data_ref")
+            if data_ref:
+                try:
+                    loaded = _get_data_store().get_timeseries(data_ref)
+                    logger.info(
+                        "gapfilling_price_recovered_from_store data_ref=%s symbol=%s source=%s",
+                        data_ref,
+                        loaded.get("symbol"),
+                        loaded.get("source"),
+                    )
+                    return loaded
+                except KeyError as error:
+                    logger.warning(
+                        "gapfilling_price_recovery_store_miss data_ref=%s error=%s",
+                        data_ref,
+                        error,
+                    )
             return direct_payload
 
         user_texts = [
@@ -2862,15 +3006,25 @@ class TimeSeriesConstructionProcessor:
 
     @staticmethod
     def _extract_filled_data_from_messages(messages: list[dict[str, str]]) -> dict[str, Any] | None:
-        """Extract filled series payload from tool results or transfer context."""
+        """Extract filled series reference (data_ref + metadata) from tool results or transfer context.
+
+        Returns a compact dict with ``data_ref``, ``symbol``, ``source``, and
+        ``method`` – never the full filled dates/prices arrays.  The full series
+        is loaded from the DataStore on demand by downstream tools.
+        """
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
                 try:
                     tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
                 except json.JSONDecodeError:
                     continue
-                if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("prices"):
-                    return tool_result
+                if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("data_ref"):
+                    return {
+                        "data_ref": tool_result["data_ref"],
+                        "symbol": tool_result.get("symbol"),
+                        "source": tool_result.get("source"),
+                        "method": tool_result.get("method"),
+                    }
 
         for message in messages:
             if message.get("role") != "user":
@@ -2887,8 +3041,13 @@ class TimeSeriesConstructionProcessor:
                 parsed = json.loads(match.group(1))
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict) and parsed.get("prices"):
-                return parsed
+            if isinstance(parsed, dict) and parsed.get("data_ref") and parsed.get("method"):
+                return {
+                    "data_ref": parsed["data_ref"],
+                    "symbol": parsed.get("symbol"),
+                    "source": parsed.get("source"),
+                    "method": parsed.get("method"),
+                }
         return None
 
     @staticmethod
@@ -2945,16 +3104,55 @@ class TimeSeriesConstructionProcessor:
         filled_data = self._extract_filled_data_from_messages(messages)
         csv_path, chart_path = self._extract_artifact_paths_from_messages(messages)
 
+        # If we only have a data_ref (not the full series), load the full
+        # filled series from the DataStore so build/visualize can operate.
+        if filled_data is not None and filled_data.get("data_ref") and not filled_data.get("prices"):
+            try:
+                loaded_filled = _get_data_store().get_gap_filled_series(filled_data["data_ref"])
+                filled_data = {
+                    "data_ref": filled_data["data_ref"],
+                    "symbol": loaded_filled.get("symbol"),
+                    "source": loaded_filled.get("source"),
+                    "method": loaded_filled.get("method"),
+                    "dates": loaded_filled.get("filled_dates"),
+                    "prices": loaded_filled.get("filled_prices"),
+                    "original_dates": loaded_filled.get("original_dates"),
+                    "original_prices": loaded_filled.get("original_prices"),
+                }
+                logger.info(
+                    "construction_filled_data_loaded_from_store data_ref=%s symbol=%s method=%s",
+                    filled_data["data_ref"],
+                    filled_data.get("symbol"),
+                    filled_data.get("method"),
+                )
+            except KeyError as error:
+                logger.warning(
+                    "construction_filled_data_store_miss data_ref=%s error=%s",
+                    filled_data.get("data_ref"),
+                    error,
+                )
+
         if filled_data is not None:
+            # The tools load data from the database using identifiers.
+            # Pass data_ref (or symbol+source) – never the full payload.
+            filled_ref = filled_data.get("data_ref")
+            filled_symbol = filled_data.get("symbol")
+            filled_source = filled_data.get("source")
+
             if not csv_path:
                 build_tool = get_tool("build_timeseries")
                 if build_tool is None:
                     return None
-                build_args = {
-                    "series": filled_data,
+                build_args: dict[str, Any] = {
                     "filename": "final_timeseries.csv",
                     "run_id": self.handler.session_id,
                 }
+                if filled_ref:
+                    build_args["data_ref"] = filled_ref
+                if filled_symbol:
+                    build_args["symbol"] = filled_symbol
+                if filled_source:
+                    build_args["source"] = filled_source
                 try:
                     csv_result = build_tool.invoke(build_args)
                 except Exception as error:
@@ -2987,11 +3185,16 @@ class TimeSeriesConstructionProcessor:
                 if visualize_tool is None:
                     return None
                 title_symbol = str(filled_data.get("symbol") or "Instrument")
-                visual_args = {
-                    "prices": filled_data,
+                visual_args: dict[str, Any] = {
                     "title": f"{title_symbol} continuous time series",
                     "run_id": self.handler.session_id,
                 }
+                if filled_ref:
+                    visual_args["data_ref"] = filled_ref
+                if filled_symbol:
+                    visual_args["symbol"] = filled_symbol
+                if filled_source:
+                    visual_args["source"] = filled_source
                 try:
                     chart_result = visualize_tool.invoke(visual_args)
                 except Exception as error:
@@ -3367,32 +3570,34 @@ class TimeSeriesConstructionProcessor:
             if recovered_filled_data is not None:
                 payload_key = "series" if name == "build_timeseries" else "prices"
                 payload_value = args.get(payload_key)
-                if not isinstance(payload_value, dict) or (
-                    isinstance(recovered_filled_data.get("prices"), list)
-                    and len(recovered_filled_data.get("prices", [])) >= len(payload_value.get("prices", []))
-                ):
-                    merged_payload = dict(recovered_filled_data)
-                    if isinstance(payload_value, dict):
-                        for key, value in payload_value.items():
-                            if key not in {
-                                "dates",
-                                "prices",
-                                "filled_dates",
-                                "filled_prices",
-                                "original_dates",
-                                "original_prices",
-                                "method",
-                                "gap_filling_method",
-                            }:
-                                merged_payload.setdefault(key, value)
-                    args[payload_key] = merged_payload
-                    logger.info(
-                        "tool_arg_recovered agent=%s tool=%s source=filled_context symbol=%s method=%s",
-                        agent.name,
-                        name,
-                        merged_payload.get("symbol"),
-                        merged_payload.get("method"),
-                    )
+
+                # The tools now load data from the database using identifiers.
+                # Pass data_ref (or symbol+source) so the tool can resolve the
+                # full series from the DataStore – never pass the full payload.
+                data_ref = recovered_filled_data.get("data_ref")
+                symbol = recovered_filled_data.get("symbol") or args.get("symbol")
+                source = recovered_filled_data.get("source") or args.get("source")
+
+                if data_ref and not args.get("data_ref"):
+                    args["data_ref"] = data_ref
+                if symbol and not args.get("symbol"):
+                    args["symbol"] = symbol
+                if source and not args.get("source"):
+                    args["source"] = source
+
+                # Remove any inline payload dicts so the tool always loads
+                # from the database.
+                if payload_key in args and not isinstance(args[payload_key], dict):
+                    args.pop(payload_key, None)
+
+                logger.info(
+                    "tool_arg_recovered agent=%s tool=%s source=filled_context data_ref=%s symbol=%s method=%s",
+                    agent.name,
+                    name,
+                    data_ref,
+                    symbol,
+                    recovered_filled_data.get("method"),
+                )
 
         if name == "delegate_to_agent":
             target_name = str(args.get("agent_name", "")).strip()
@@ -4100,6 +4305,32 @@ class TimeSeriesConstructionProcessor:
                 if "method" not in series_payload and "gap_filling_method" in series_payload:
                     series_payload["method"] = series_payload.get("gap_filling_method")
                 normalized["series"] = series_payload
+            # Support symbol/source identifiers for database lookups.
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if "source" not in normalized and isinstance(normalized.get("data_source"), str):
+                normalized["source"] = normalized["data_source"]
+            # If a data_ref is present, prefer it over inline series.
+            if normalized.get("data_ref") and "series" in normalized:
+                normalized.pop("series", None)
+        if tool_name == "visualize_timeseries":
+            # Support symbol/source identifiers for database lookups.
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if "source" not in normalized and isinstance(normalized.get("data_source"), str):
+                normalized["source"] = normalized["data_source"]
+            # If a data_ref is present, prefer it over inline prices.
+            if normalized.get("data_ref") and "prices" in normalized:
+                normalized.pop("prices", None)
+        if tool_name == "apply_gap_filling":
+            # Support symbol/source identifiers for database lookups.
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if "source" not in normalized and isinstance(normalized.get("data_source"), str):
+                normalized["source"] = normalized["data_source"]
+            # If a data_ref is present, prefer it over inline prices.
+            if normalized.get("data_ref") and "prices" in normalized:
+                normalized.pop("prices", None)
         if tool_name in {"extract_requested_date_range", "normalize_requested_dates"}:
             if "request" not in normalized and "text" in normalized:
                 normalized["request"] = normalized["text"]
@@ -4355,6 +4586,57 @@ class TimeSeriesConstructionProcessor:
             except (SyntaxError, ValueError):
                 return None
         return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _build_agent_format_override(agent_name: str) -> str:
+        """Build an agent-specific FORMAT_OVERRIDE prompt.
+
+        Local models that produce unparseable ReAct output are given an exact
+        example of the required format. The example must match the agent's
+        on-contract tools so the model is steered back to the correct workflow
+        stage rather than being told to call an off-contract tool (which is
+        what happens when a generic get_instrument_details override is used
+        for every agent).
+        """
+        agent_specific_examples: dict[str, tuple[str, str]] = {
+            "Orchestrator": (
+                "delegate_to_agent",
+                '{"agent_name": "ReferenceDataAgent", "request": "Build AAPL from 2023-01-01 to 2023-12-31"}',
+            ),
+            "ReferenceDataAgent": (
+                "get_instrument_details",
+                '{"query": "AAPL"}',
+            ),
+            "MarketDataAgent": (
+                "historical_prices",
+                '{"symbol": "AAPL", "start_date": "2023-01-01", "end_date": "2023-12-31", "source": "yahoo"}',
+            ),
+            "DataQualityAgent": (
+                "check_data_quality",
+                '{"source": "yahoo", "symbol": "AAPL"}',
+            ),
+            "GapFillingAgent": (
+                "apply_gap_filling",
+                '{"method": "linear_interpolation", "data_ref": "<data_ref_from_previous_tool>"}',
+            ),
+            "TimeSeriesConstructionAgent": (
+                "build_timeseries",
+                '{"filename": "final_timeseries.csv", "data_ref": "<data_ref_from_previous_tool>"}',
+            ),
+            "ReportingAgent": (
+                "generate_report",
+                '{"filename": "quality_report.csv"}',
+            ),
+        }
+        tool_name, tool_example = agent_specific_examples.get(
+            agent_name,
+            ("get_instrument_details", '{"query": "AAPL"}'),
+        )
+        return (
+            "[SYSTEM_NOTE] FORMAT_OVERRIDE: Output exactly this format without any additional text:\n"
+            f"Action: {tool_name}\n"
+            f"Action Input: {tool_example}"
+        )
 
     @staticmethod
     def _prompt(agent: Agent) -> str:

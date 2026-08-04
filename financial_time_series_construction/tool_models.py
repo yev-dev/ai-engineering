@@ -102,9 +102,14 @@ class CheckDataQualityInput(BaseModel):
 
 
 class ApplyGapFillingInput(BaseModel):
-    """Validated input for the ``apply_gap_filling`` tool."""
+    """Validated input for the ``apply_gap_filling`` tool.
 
-    prices: dict[str, Any] | None = Field(None, description="Dict with 'prices' and 'dates' keys")
+    The LLM only needs to provide identifiers (``data_ref`` or
+    ``symbol`` + ``source``) – the full time series is always loaded
+    from the database by the tool.
+    """
+
+    prices: dict[str, Any] | None = Field(None, description="Backward-compat dict with 'prices' and 'dates' keys")
     data_ref: str | None = Field(None, description="Reference key to load prices from DataStore")
     method: str = Field(
         ...,
@@ -112,21 +117,62 @@ class ApplyGapFillingInput(BaseModel):
         description="Gap-filling method",
     )
     dates: list[str] | None = Field(None, description="Optional override for date index")
+    symbol: str | None = Field(None, min_length=1, max_length=20, description="Ticker symbol (with source)")
+    source: str | None = Field(None, pattern=r"^(yahoo|bloomberg|reuters)$", description="Data source name (with symbol)")
 
     @model_validator(mode="after")
     def resolve_prices(self) -> "ApplyGapFillingInput":
-        if self.prices is None and self.data_ref is None:
-            raise ValueError("apply_gap_filling requires either 'prices' or 'data_ref'")
+        has_inline = self.prices is not None
+        has_ref = self.data_ref is not None
+        has_identifiers = self.symbol is not None and self.source is not None
+        if not has_inline and not has_ref and not has_identifiers:
+            raise ValueError(
+                "apply_gap_filling requires 'prices', 'data_ref', or 'symbol' + 'source'"
+            )
         return self
 
 
 class BuildTimeseriesInput(BaseModel):
-    """Validated input for the ``build_timeseries`` tool."""
+    """Validated input for the ``build_timeseries`` tool.
 
-    series: dict[str, Any] | None = Field(None, description="Dict with 'dates' and 'prices' keys")
+    The LLM only needs to provide identifiers (``data_ref`` or
+    ``symbol`` + ``source``) – the full time series is always loaded
+    from the database by the tool.
+    """
+
+    series: dict[str, Any] | None = Field(None, description="Backward-compat dict with 'dates' and 'prices' keys")
     data_ref: str | None = Field(None, description="Reference key to load series from DataStore")
     filename: str = Field("final_timeseries.csv", description="Output filename")
     run_id: str | None = Field(None, description="Optional run identifier")
+    symbol: str | None = Field(None, min_length=1, max_length=20, description="Ticker symbol (with source)")
+    source: str | None = Field(None, pattern=r"^(yahoo|bloomberg|reuters)$", description="Data source name (with symbol)")
+
+
+class VisualizeTimeseriesInput(BaseModel):
+    """Validated input for the ``visualize_timeseries`` tool.
+
+    The LLM only needs to provide identifiers (``data_ref`` or
+    ``symbol`` + ``source``) – the full time series is always loaded
+    from the database by the tool.
+    """
+
+    prices: dict[str, Any] | None = Field(None, description="Backward-compat dict with 'dates' and 'prices' keys")
+    title: str = Field("Time series", description="Chart title")
+    run_id: str | None = Field(None, description="Optional run identifier")
+    data_ref: str | None = Field(None, description="Reference key to load series from DataStore")
+    symbol: str | None = Field(None, min_length=1, max_length=20, description="Ticker symbol (with source)")
+    source: str | None = Field(None, pattern=r"^(yahoo|bloomberg|reuters)$", description="Data source name (with symbol)")
+
+    @model_validator(mode="after")
+    def resolve_prices(self) -> "VisualizeTimeseriesInput":
+        has_inline = self.prices is not None
+        has_ref = self.data_ref is not None
+        has_identifiers = self.symbol is not None and self.source is not None
+        if not has_inline and not has_ref and not has_identifiers:
+            raise ValueError(
+                "visualize_timeseries requires 'prices', 'data_ref', or 'symbol' + 'source'"
+            )
+        return self
 
 
 class DelegateToAgentInput(BaseModel):
@@ -167,6 +213,7 @@ TOOL_INPUT_MODELS: dict[str, type[BaseModel]] = {
     "check_data_quality": CheckDataQualityInput,
     "apply_gap_filling": ApplyGapFillingInput,
     "build_timeseries": BuildTimeseriesInput,
+    "visualize_timeseries": VisualizeTimeseriesInput,
     "delegate_to_agent": DelegateToAgentInput,
     "request_human_input": RequestHumanInput,
     "get_instrument_details": GetInstrumentDetailsInput,

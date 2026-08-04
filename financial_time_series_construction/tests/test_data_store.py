@@ -8,7 +8,7 @@ from typing import Any, Generator
 
 import pytest
 
-from financial_time_series_construction.time_series_construction import (
+from financial_time_series_construction.database import (
     DataStore,
     get_datastore,
     init_datastore,
@@ -108,7 +108,7 @@ class TestDataStoreInit:
         store.put_timeseries("run1", "AAPL", "yahoo", dates, prices)
         with sqlite3.connect(store.db_path) as conn:
             rows = conn.execute(
-                "SELECT trading_date, price FROM raw_timeseries ORDER BY trading_date"
+                "SELECT date, price FROM raw_timeseries ORDER BY date"
             ).fetchall()
         assert [(r[0], r[1]) for r in rows] == [
             ("2024-01-01", 150.0),
@@ -121,7 +121,7 @@ class TestDataStoreInit:
         store.put_timeseries("run1", "AAPL", "yahoo", ["2024-01-01"], [150.0])
         with sqlite3.connect(store.db_path) as conn:
             row = conn.execute(
-                "SELECT run_id, instrument_id, source_id, trading_date, price "
+                "SELECT run_id, instrument_id, source_id, date, price "
                 "FROM raw_timeseries"
             ).fetchone()
         assert isinstance(row[0], int)
@@ -533,7 +533,9 @@ class TestDataStoreGapFilledSeries:
             filled_prices=[100.0, 100.0],
         )
         result = store.get_gap_filled_series(data_ref)
-        assert result["original_data_ref"] is None
+        # The original_data_ref is reconstructed from run_id/symbol/source
+        # since it's derivable from the filled series' own identifiers.
+        assert result["original_data_ref"] == "run1:AAPL:yahoo"
 
     def test_put_gap_filled_series_upserts(self, store: DataStore) -> None:
         """Same data_ref should be replaceable."""
@@ -628,8 +630,11 @@ class TestDataStoreEdgeCases:
 
     def test_large_payload(self, store: DataStore) -> None:
         """Store and retrieve a large time series."""
-        dates = [f"2024-01-{day:02d}" for day in range(1, 366)]
-        prices = [float(day) for day in range(1, 366)]
+        from datetime import date, timedelta
+
+        start = date(2024, 1, 1)
+        dates = [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(365)]
+        prices = [float(i + 1) for i in range(365)]
         data_ref = store.put_timeseries("run1", "SPY", "yahoo", dates, prices)
         result = store.get_timeseries(data_ref)
         assert len(result["dates"]) == 365

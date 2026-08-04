@@ -816,6 +816,9 @@ class DataStore:
         method: str,
         filled_dates: list[str],
         filled_prices: list[Any],
+        original_dates: list[str] | None = None,
+        original_prices: list[Any] | None = None,
+        original_data_ref: str | None = None,
     ) -> str:
         """Store a gap-filled time series and return a reference key.
 
@@ -833,6 +836,9 @@ class DataStore:
                 ``linear_interpolation``).
             filled_dates: Date strings after filling.
             filled_prices: Price values after filling.
+            original_dates: Optional original (pre-filling) date strings.
+            original_prices: Optional original (pre-filling) price values.
+            original_data_ref: Optional reference to the raw source series.
 
         Returns:
             A ``data_ref`` string of the form ``<run_id>:<symbol>:<source>:filled``.
@@ -870,12 +876,12 @@ class DataStore:
         )
         conn.commit()
         logger.info(
-            "Gap-filled series stored: data_ref=%s symbol=%s source=%s method=%s",
-            data_ref, symbol, source, method,
+            "Gap-filled series stored: data_ref=%s symbol=%s source=%s method=%s observations=%d",
+            data_ref, symbol, source, method, len(filled_dates),
         )
         logger.debug(
-            "gap_filled_series_stored data_ref=%s symbol=%s source=%s method=%s",
-            data_ref, symbol, source, method,
+            "gap_filled_series_stored data_ref=%s symbol=%s source=%s method=%s original_ref=%s",
+            data_ref, symbol, source, method, original_data_ref,
         )
         return data_ref
 
@@ -953,6 +959,7 @@ class DataStore:
             "original_prices": original_prices,
             "filled_dates": filled_dates,
             "filled_prices": filled_prices,
+            "original_data_ref": f"{run_id}:{symbol}:{source}",
         }
 
     def list_gap_filled_series(

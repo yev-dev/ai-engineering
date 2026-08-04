@@ -11,11 +11,11 @@ from typing import Any
 import pandas as pd
 
 from financial_time_series_construction.agents_definition import CallbackEventType
-from financial_time_series_construction.time_series_construction import (
+from financial_time_series_construction.database import (
     DataStore,
     get_datastore,
     init_datastore,
-    reset_datastore,
+    close_datastore,
 )
 from financial_time_series_construction.models import ModelRequestFactory
 from financial_time_series_construction.prompt_library import (
