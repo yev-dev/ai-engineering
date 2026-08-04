@@ -48,7 +48,8 @@ class Agent:
 _REACT_COMMON = """You are a ReAct financial data construction agent. Use tools for facts and never invent data.
 Respond with Thought, Action, Action Input JSON, and finally Final Answer. Ask for human
 input whenever a user decision is required. Adapt your sequence of actions from user context
-rather than following a rigid fixed workflow. Delegate to specialist agents when appropriate."""
+rather than following a rigid fixed workflow. Delegate to specialist agents when appropriate.
+Use exactly one tool call per response and never repeat an equivalent tool call after a successful result."""
 
 AGENT_REGISTRY: dict[str, Agent] = {
     "Orchestrator": Agent(
@@ -110,7 +111,9 @@ AGENT_REGISTRY: dict[str, Agent] = {
         description="Retrieves historical data from relevant available sources based on request context.",
         system_prompt=(
             _REACT_COMMON
-            + " List sources, load each source, then delegate to DataQualityAgent. Use "
+            + " Use available_data_sources once to discover the source list, then let the workflow "
+            "retrieve all listed sources in one pass before delegating to DataQualityAgent. Do not "
+            "ask the user to pick a single source or narrate a source-by-source plan. Use "
             "historical_prices with normalized yyyy-mm-dd dates after interpreting user date text."
         ),
         tools=[
@@ -125,6 +128,7 @@ AGENT_REGISTRY: dict[str, Agent] = {
             "Report unavailable sources or empty date ranges explicitly.",
             "Never fill missing values in this stage.",
             "Preserve source names in every result.",
+            "Call available_data_sources at most once per request.",
         ),
     ),
     "DataQualityAgent": Agent(
@@ -132,9 +136,11 @@ AGENT_REGISTRY: dict[str, Agent] = {
         description="Evaluates source quality and highlights trade-offs for user decision-making.",
         system_prompt=(
             _REACT_COMMON
-            + " Check every series and delegate to ReportingAgent for source selection. "
-            "Use historical_prices to retrieve data for each source, then call "
-            "check_data_quality on each series to produce measurable quality metrics."
+            + " Check every series already provided by MarketDataAgent and delegate to "
+            "ReportingAgent for source selection. Use check_data_quality on each source "
+            "series to produce measurable quality metrics. Do not re-resolve instrument "
+            "metadata and do not call source discovery tools in this stage. Use "
+            "historical_prices only as a fallback when a required source payload is missing."
         ),
         tools=["check_data_quality", "historical_prices", "delegate_to_agent"],
         goal="Compare source completeness and data-quality issues using measurable metrics.",
@@ -142,6 +148,8 @@ AGENT_REGISTRY: dict[str, Agent] = {
             "Do not call a series complete when it contains missing values.",
             "Include one report per source.",
             "Explain when no source has usable observations.",
+            "Never call get_instrument_details in this stage.",
+            "Never call available_data_sources in this stage.",
         ),
     ),
     "GapFillingAgent": Agent(
@@ -190,6 +198,7 @@ AGENT_REGISTRY: dict[str, Agent] = {
             "State limitations plainly.",
             "Never select a source on the user's behalf.",
             "Include artifact paths when available.",
+            "After final artifact summary mode is requested, do not delegate back to other agents.",
         ),
     ),
 }

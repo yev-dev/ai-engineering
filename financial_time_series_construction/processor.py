@@ -16,18 +16,23 @@ from financial_time_series_construction.agents_definition import (
 from financial_time_series_construction.handler import TimeSeriesConstructionHandler
 from financial_time_series_construction.models import LLMRequest, ModelRequestFactory
 from financial_time_series_construction.tools import (
+    SOURCES,
     extract_date_range,
     get_instrument_details,
     get_tool,
     get_tool_description,
     normalize_date_range,
+    set_run_id,
+    _get_data_store,
 )
+from financial_time_series_construction.tool_models import validate_tool_input
+
 from financial_time_series_construction.prompts import (
     agent_system_prompt,
     request_prompt,
     unavailable_message,
 )
-from financial_time_series_construction.debug_logger import (
+from financial_time_series_construction.logger import (
     LoopDetector,
     log_message_size,
     log_workflow_progress,
@@ -140,6 +145,10 @@ class TimeSeriesConstructionProcessor:
                 )
             ]
 
+        # Record run metadata (run_id, start_date, end_date) in the database
+        # when the workflow starts with a valid request.
+        self._record_run_metadata(user_input)
+
         direct_events = self._try_direct_delegate_from_request(user_input)
         if direct_events is not None:
             return direct_events
@@ -152,6 +161,42 @@ class TimeSeriesConstructionProcessor:
             get_agent("Orchestrator"),
             [{"role": "user", "content": user_input}],
         )
+
+    def _record_run_metadata(self, user_input: str) -> None:
+        """Record run id, start_date and end_date in the runs table.
+
+        Extracts the date range from the user request and persists it in the
+        DataStore's ``runs`` table for the current session/run.
+
+        Args:
+            user_input: The user's natural language request.
+        """
+        run_id = self.handler.session_id
+        start_date: str | None = None
+        end_date: str | None = None
+        try:
+            extracted = extract_date_range(user_input)
+            if extracted is not None:
+                start_date, end_date = extracted
+        except ValueError:
+            logger.debug("run_metadata_date_parse_failed run_id=%s", run_id)
+
+        try:
+            set_run_id(run_id)
+            _get_data_store().put_run_metadata(
+                run_id=run_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            logger.info(
+                "run_metadata_recorded run_id=%s start_date=%s end_date=%s",
+                run_id, start_date, end_date,
+            )
+        except Exception as error:
+            logger.warning(
+                "run_metadata_store_failed run_id=%s error=%s",
+                run_id, error,
+            )
 
     def _try_direct_delegate_from_request(self, user_input: str) -> list[CallbackEvent] | None:
         """Deterministically delegate when request already includes instrument + date range.
@@ -297,6 +342,145 @@ class TimeSeriesConstructionProcessor:
         return found
 
     @staticmethod
+    def _extract_available_sources_from_messages(messages: list[dict[str, str]]) -> list[str]:
+        """Extract a source list from available_data_sources tool results."""
+        sources: list[str] = []
+        seen: set[str] = set()
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            try:
+                payload = json.loads(message["content"].replace("Tool result: ", "", 1))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, list):
+                for item in payload:
+                    source = str(item).strip().casefold()
+                    if source in SOURCES and source not in seen:
+                        seen.add(source)
+                        sources.append(source)
+            elif isinstance(payload, dict):
+                candidate_sources = payload.get("sources")
+                if isinstance(candidate_sources, list):
+                    for item in candidate_sources:
+                        source = str(item).strip().casefold()
+                        if source in SOURCES and source not in seen:
+                            seen.add(source)
+                            sources.append(source)
+        return sources
+
+    @staticmethod
+    def _extract_market_source_context_from_messages(
+        messages: list[dict[str, str]],
+    ) -> tuple[list[str], list[dict[str, str]], str | None]:
+        """Extract loaded market sources, unavailable sources, and symbol from tool results."""
+        loaded_sources: list[str] = []
+        unavailable_sources: list[dict[str, str]] = []
+        resolved_symbol: str | None = None
+        seen_loaded: set[str] = set()
+        seen_unavailable: set[tuple[str, str]] = set()
+
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            try:
+                payload = json.loads(message["content"].replace("Tool result: ", "", 1))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            if payload.get("dates") and payload.get("source"):
+                source = str(payload.get("source", "")).strip().casefold()
+                if source and source not in seen_loaded:
+                    seen_loaded.add(source)
+                    loaded_sources.append(source)
+                if resolved_symbol is None and payload.get("symbol"):
+                    resolved_symbol = str(payload.get("symbol"))
+                continue
+
+            if payload.get("market_data_available") is False or payload.get("non_fatal") is True:
+                source = str(payload.get("source", "")).strip().casefold()
+                reason = str(payload.get("error", payload.get("message", "source unavailable"))).strip()
+                if not source:
+                    continue
+                key = (source, reason)
+                if key in seen_unavailable:
+                    continue
+                seen_unavailable.add(key)
+                unavailable_sources.append({"source": source, "reason": reason})
+
+        return loaded_sources, unavailable_sources, resolved_symbol
+
+    def _deterministically_load_market_sources(
+        self,
+        agent: Agent,
+        messages: list[dict[str, str]],
+        iteration: int,
+        symbol: str,
+        start_date: str,
+        end_date: str,
+        candidate_sources: list[str],
+        loaded_sources: list[str],
+    ) -> None:
+        """Load any missing market-data sources without additional LLM turns."""
+        historical_tool = get_tool("historical_prices")
+        if historical_tool is None:
+            return
+
+        loaded = {source.casefold() for source in loaded_sources}
+        for source in candidate_sources:
+            source_key = str(source).strip().casefold()
+            if not source_key or source_key in loaded:
+                continue
+
+            tool_args = {
+                "symbol": symbol,
+                "start_date": start_date,
+                "end_date": end_date,
+                "source": source_key,
+            }
+            try:
+                result = historical_tool.invoke(tool_args)
+            except Exception as error:
+                result = {
+                    "market_data_available": False,
+                    "non_fatal": True,
+                    "source": source_key,
+                    "symbol": symbol,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "error": str(error),
+                }
+
+            self.handler.add_trace_record(
+                "tool_call",
+                {
+                    "tool": "historical_prices",
+                    "description": get_tool_description("historical_prices"),
+                    "arguments": tool_args,
+                },
+                agent=agent.name,
+                iteration=iteration,
+            )
+            self.handler.add_trace_record(
+                "tool_result",
+                {
+                    "tool": "historical_prices",
+                    "description": get_tool_description("historical_prices"),
+                    "result": result,
+                },
+                agent=agent.name,
+                iteration=iteration,
+            )
+            # Strip full payload from LLM-visible message to avoid token bloat
+            llm_result = TimeSeriesConstructionProcessor._strip_payload_for_llm(result)
+            messages.append({"role": "user", "content": f"Tool result: {json.dumps(llm_result, default=str)}"})
+
+            if isinstance(result, dict) and result.get("source") and result.get("dates"):
+                loaded.add(source_key)
+
+    @staticmethod
     def _extract_explicit_source_selection(text: str) -> str | None:
         """Extract user-explicit source selection from text.
 
@@ -307,6 +491,24 @@ class TimeSeriesConstructionProcessor:
         unique = sorted(set(mentioned))
         if len(unique) == 1:
             return unique[0]
+        return None
+
+    @staticmethod
+    def _extract_selected_source_marker_from_messages(messages: list[dict[str, str]]) -> str | None:
+        """Extract source from explicit checkpoint marker lines.
+
+        Marker format is injected by deterministic resume logic:
+        [SOURCE_SELECTION] <source>
+        """
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", "").strip()
+            if not content.startswith("[SOURCE_SELECTION]"):
+                continue
+            selected = TimeSeriesConstructionProcessor._extract_explicit_source_selection(content)
+            if selected:
+                return selected
         return None
 
     @staticmethod
@@ -339,8 +541,8 @@ class TimeSeriesConstructionProcessor:
                 unavailable.append({"source": source, "reason": reason})
         return unavailable
 
-    @staticmethod
     def _log_continuation_decision(
+        self,
         agent: str,
         iteration: int,
         status: str,
@@ -354,6 +556,15 @@ class TimeSeriesConstructionProcessor:
             iteration,
             status,
             detail,
+        )
+        self.handler.add_trace_record(
+            "continuation_decision",
+            {
+                "status": status,
+                "detail": detail,
+            },
+            agent=agent,
+            iteration=iteration,
         )
 
     @staticmethod
@@ -683,6 +894,9 @@ class TimeSeriesConstructionProcessor:
         auto_progress = self._try_auto_progress_orchestrator(state, user_input)
         if auto_progress is not None:
             return auto_progress
+        reporting_resume = self._try_resume_reporting_from_source_selection(state, user_input)
+        if reporting_resume is not None:
+            return reporting_resume
         gapfilling_resume = self._try_resume_gapfilling_from_method_selection(state, user_input)
         if gapfilling_resume is not None:
             return gapfilling_resume
@@ -707,7 +921,8 @@ class TimeSeriesConstructionProcessor:
         """
         if state.get("agent") != "GapFillingAgent":
             return None
-        if state.get("checkpoint") != "gap_method_selection":
+        checkpoint = state.get("checkpoint")
+        if checkpoint not in (None, "", "gap_method_selection"):
             return None
 
         selected_method = self._extract_explicit_gap_method(user_input)
@@ -771,13 +986,60 @@ class TimeSeriesConstructionProcessor:
             filled_result.get("symbol"),
         )
 
+        # Strip the full filled series payload from the LLM-visible message.
+        # The data_ref is sufficient for downstream tools to load from the DataStore.
+        llm_filled_result = TimeSeriesConstructionProcessor._strip_payload_for_llm(filled_result)
         resumed_messages = base_messages + [
             {"role": "user", "content": user_input},
-            {"role": "user", "content": f"Tool result: {json.dumps(filled_result, default=str)}"},
+            {"role": "user", "content": f"Tool result: {json.dumps(llm_filled_result, default=str)}"},
         ]
         continuation = self._continue_gapfilling_to_construction(
             response=f"Final Answer: Gap-filling applied with {selected_method}.",
             agent=agent,
+            messages=resumed_messages,
+            iteration=iteration,
+            visited=set(),
+        )
+        return continuation
+
+    def _try_resume_reporting_from_source_selection(
+        self,
+        state: dict[str, Any],
+        user_input: str,
+    ) -> list[CallbackEvent] | None:
+        """Deterministically continue Reporting after user source selection.
+
+        When resuming from the Reporting source-selection checkpoint, local
+        models often replay stale turns (re-asking selection, self-delegating,
+        or consuming an old queue entry). If the user explicitly selected a
+        source, continue directly to the standard Reporting->GapFilling path.
+        """
+        if state.get("agent") != "ReportingAgent":
+            return None
+        if state.get("checkpoint") != "source_selection":
+            return None
+
+        selected_source = self._extract_explicit_source_selection(user_input)
+        if not selected_source:
+            return None
+
+        reporting_agent = get_agent("ReportingAgent")
+        if reporting_agent is None:
+            return None
+
+        base_messages = list(state.get("messages", []))
+        resumed_messages = base_messages + [
+            {"role": "user", "content": user_input},
+            {"role": "user", "content": f"[SOURCE_SELECTION] {selected_source}"},
+        ]
+        iteration = int(state.get("iteration", 0) or 0)
+        logger.info(
+            "reporting_resume_auto_continue mode=deterministic source=%s reason=explicit_source_at_checkpoint",
+            selected_source,
+        )
+        continuation = self._continue_reporting_to_gapfilling(
+            response=f"Final Answer: User selected {selected_source} as the data source.",
+            agent=reporting_agent,
             messages=resumed_messages,
             iteration=iteration,
             visited=set(),
@@ -863,6 +1125,25 @@ class TimeSeriesConstructionProcessor:
             return None
 
         start_date, end_date = normalized_range
+        # Update run metadata when the date range becomes known after a
+        # clarification pause.
+        try:
+            set_run_id(self.handler.session_id)
+            _get_data_store().put_run_metadata(
+                run_id=self.handler.session_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            logger.info(
+                "run_metadata_updated run_id=%s start_date=%s end_date=%s",
+                self.handler.session_id, start_date, end_date,
+            )
+        except Exception as error:
+            logger.warning(
+                "run_metadata_update_failed run_id=%s error=%s",
+                self.handler.session_id, error,
+            )
+
         request = f"{combined_user_context} (normalized date range: {start_date} to {end_date})"
         logger.info(
             "orchestrator_auto_progress_detected mode=deterministic start=%s end=%s reason=user_followup_contains_date_range",
@@ -941,12 +1222,15 @@ class TimeSeriesConstructionProcessor:
         visited.add(agent.name)
 
         self.handler.current_agent = agent.name
+        # Inject run_id so tools can store/load time series via DataStore
+        set_run_id(self.handler.session_id)
         prompt = self._prompt(agent)
         loop_detector = LoopDetector(max_repeats=3)
+        unparseable_count = 0
         log_workflow_progress(agent.name, start, "started")
         logger.info("agent_started agent=%s iteration_start=%d", agent.name, start)
 
-        for iteration in range(start, 10):
+        for iteration in range(start, 8):
             log_workflow_progress(agent.name, iteration, "llm_call")
             logger.info("agent_iteration agent=%s iteration=%d", agent.name, iteration)
             self._debug_flow_event(
@@ -958,6 +1242,15 @@ class TimeSeriesConstructionProcessor:
 
             # Log message size to track growing conversation history
             log_message_size(agent.name, iteration, messages)
+            self.handler.add_trace_record(
+                "llm_request",
+                {
+                    "system_prompt": prompt,
+                    "messages": list(messages),
+                },
+                agent=agent.name,
+                iteration=iteration,
+            )
 
             # Get LLM response with timing
             try:
@@ -989,8 +1282,47 @@ class TimeSeriesConstructionProcessor:
             # Check for response loop (identical response as previous iteration)
             loop_detector.record_response(agent.name, iteration, response)
 
-            # Check for Final Answer
-            if "Final Answer:" in response:
+            if (
+                agent.name == "ReportingAgent"
+                and any(
+                    _REPORTING_FINAL_SUMMARY_NOTE in msg.get("content", "")
+                    for msg in messages
+                    if msg.get("role") == "user"
+                )
+            ):
+                summary_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response.strip()
+                self._log_continuation_decision(
+                    agent.name,
+                    iteration,
+                    "completed",
+                    "reporting_final_summary_terminal",
+                )
+                logger.info(
+                    "agent_completed agent=%s iteration=%d reason=reporting_final_summary_terminal",
+                    agent.name,
+                    iteration,
+                )
+                self.handler.emit(
+                    CallbackEvent(
+                        CallbackEventType.AGENT_COMPLETED,
+                        {
+                            "agent": agent.name,
+                            "result": {"final_answer": summary_text},
+                        },
+                    )
+                )
+                return self._drain()
+
+            # Check for Final Answer, including models that emit "Action: Final Answer".
+            if "Final Answer:" in response or re.search(r"Action:\s*Final\s+Answer\b", response, re.IGNORECASE):
+                if "Final Answer:" not in response and re.search(r"Action:\s*Final\s+Answer\b", response, re.IGNORECASE):
+                    response = re.sub(
+                        r"Action:\s*Final\s+Answer",
+                        "Final Answer:",
+                        response,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
                 log_workflow_progress(agent.name, iteration, "final_answer", detail="llm_returned_final_answer")
                 if (
                     agent.name == "MarketDataAgent"
@@ -1094,8 +1426,64 @@ class TimeSeriesConstructionProcessor:
                     iteration,
                     ",".join(call["name"] for call in calls),
                 )
+            self.handler.add_trace_record(
+                "parsed_actions",
+                {
+                    "count": len(calls),
+                    "calls": calls,
+                },
+                agent=agent.name,
+                iteration=iteration,
+            )
 
             if not calls:
+                unparseable_count += 1
+                if agent.name == "DataQualityAgent":
+                    deterministic_quality = self._continue_quality_to_reporting(
+                        response,
+                        agent,
+                        messages,
+                        iteration,
+                        visited,
+                    )
+                    if deterministic_quality is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail="quality_recovered_after_unparseable_actions",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            "quality_recovered_after_unparseable_actions",
+                        )
+                        return deterministic_quality
+                if agent.name == "GapFillingAgent":
+                    deterministic_gap = self._continue_gapfilling_to_construction(
+                        response,
+                        agent,
+                        messages,
+                        iteration,
+                        visited,
+                    )
+                    if deterministic_gap is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail="gapfilling_recovered_after_unparseable_actions",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "pausing",
+                            "gapfilling_recovered_after_unparseable_actions",
+                        )
+                        return deterministic_gap
                 if agent.name == "TimeSeriesConstructionAgent":
                     deterministic_construction = self._continue_construction_to_reporting(
                         response,
@@ -1154,12 +1542,21 @@ class TimeSeriesConstructionProcessor:
                 )
                 if recovery is not None:
                     return recovery
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "Use the required Action and Action Input JSON format.",
-                    }
-                )
+                if unparseable_count >= 3:
+                    format_override = self._build_agent_format_override(agent.name)
+                    messages.append({"role": "user", "content": format_override})
+                    logger.warning(
+                        "format_override_injected agent=%s iteration=%d reason=unparseable_count_exceeded",
+                        agent.name,
+                        iteration,
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "Use the required Action and Action Input JSON format.",
+                        }
+                    )
                 self._debug_flow_event(
                     component="processor",
                     stage="re_prompt_for_action_format",
@@ -1174,8 +1571,137 @@ class TimeSeriesConstructionProcessor:
                     iteration=iteration,
                 )
 
+            # Reset the unparseable counter when the model produces valid tool
+            # calls. This prevents the format_override from being re-injected
+            # after the model has recovered and is producing parseable output.
+            unparseable_count = 0
+
             # Execute each tool call
             for call in calls:
+                if agent.name == "GapFillingAgent":
+                    last_user_message = next(
+                        (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
+                        "",
+                    )
+                    selected_method = self._extract_explicit_gap_method(last_user_message)
+                    if (
+                        selected_method
+                        and call["name"] in {
+                            "check_data_quality",
+                            "get_instrument_details",
+                            "available_data_sources",
+                            "extract_requested_date_range",
+                            "normalize_requested_dates",
+                            "request_human_input",
+                            "recommend_gap_methods",
+                        }
+                    ):
+                        logger.warning(
+                            "off_contract_tool_recovered mode=deterministic agent=%s iteration=%d tool=%s method=%s",
+                            agent.name,
+                            iteration,
+                            call["name"],
+                            selected_method,
+                        )
+                        gap_continuation = self._continue_gapfilling_to_construction(
+                            response="",
+                            agent=agent,
+                            messages=messages,
+                            iteration=iteration,
+                            visited=visited,
+                        )
+                        if gap_continuation is not None:
+                            self._debug_flow_event(
+                                component="processor",
+                                stage="deterministic_recovery",
+                                agent=agent.name,
+                                iteration=iteration,
+                                detail=f"gapfilling_recovered_after_off_contract_{call['name']}",
+                            )
+                            self._log_continuation_decision(
+                                agent.name,
+                                iteration,
+                                "delegating",
+                                f"gapfilling_recovered_after_off_contract_{call['name']}",
+                            )
+                            return gap_continuation
+
+                if agent.name == "DataQualityAgent" and call["name"] in {
+                    "get_instrument_details",
+                    "available_data_sources",
+                    "extract_requested_date_range",
+                    "normalize_requested_dates",
+                }:
+                    logger.warning(
+                        "off_contract_tool_recovered mode=deterministic agent=%s iteration=%d tool=%s",
+                        agent.name,
+                        iteration,
+                        call["name"],
+                    )
+                    quality_continuation = self._continue_quality_to_reporting(
+                        response="",
+                        agent=agent,
+                        messages=messages,
+                        iteration=iteration,
+                        visited=visited,
+                    )
+                    if quality_continuation is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail=f"quality_recovered_after_off_contract_{call['name']}",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            f"quality_recovered_after_off_contract_{call['name']}",
+                        )
+                        return quality_continuation
+
+                if agent.name == "TimeSeriesConstructionAgent" and call["name"] in {
+                    "get_instrument_details",
+                    "available_data_sources",
+                    "historical_prices",
+                    "check_data_quality",
+                    "extract_requested_date_range",
+                    "normalize_requested_dates",
+                    "recommend_gap_methods",
+                    "apply_gap_filling",
+                    "request_human_input",
+                    "generate_report",
+                }:
+                    logger.warning(
+                        "off_contract_tool_recovered mode=deterministic agent=%s iteration=%d tool=%s",
+                        agent.name,
+                        iteration,
+                        call["name"],
+                    )
+                    construction_continuation = self._continue_construction_to_reporting(
+                        response="",
+                        agent=agent,
+                        messages=messages,
+                        iteration=iteration,
+                        visited=visited,
+                    )
+                    if construction_continuation is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail=f"construction_recovered_after_off_contract_{call['name']}",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            f"construction_recovered_after_off_contract_{call['name']}",
+                        )
+                        return construction_continuation
+
                 log_workflow_progress(
                     agent.name,
                     iteration,
@@ -1201,6 +1727,54 @@ class TimeSeriesConstructionProcessor:
                         "content": f"Tool result: {json.dumps(result, default=str)}",
                     }
                 )
+
+                if agent.name == "MarketDataAgent" and call["name"] in {"available_data_sources", "historical_prices"}:
+                    market_continuation = self._continue_market_to_quality(
+                        response="",
+                        agent=agent,
+                        messages=messages,
+                        iteration=iteration,
+                        visited=visited,
+                    )
+                    if market_continuation is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail=f"market_auto_continued_after_{call['name']}",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            f"market_auto_continued_after_{call['name']}",
+                        )
+                        return market_continuation
+
+                if agent.name == "DataQualityAgent" and call["name"] == "check_data_quality":
+                    quality_continuation = self._continue_quality_to_reporting(
+                        response="",
+                        agent=agent,
+                        messages=messages,
+                        iteration=iteration,
+                        visited=visited,
+                    )
+                    if quality_continuation is not None:
+                        self._debug_flow_event(
+                            component="processor",
+                            stage="deterministic_recovery",
+                            agent=agent.name,
+                            iteration=iteration,
+                            detail="quality_auto_continued_after_check_data_quality",
+                        )
+                        self._log_continuation_decision(
+                            agent.name,
+                            iteration,
+                            "delegating",
+                            "quality_auto_continued_after_check_data_quality",
+                        )
+                        return quality_continuation
 
         # Iteration limit reached
         self.handler.emit(
@@ -1491,47 +2065,56 @@ class TimeSeriesConstructionProcessor:
         Checks if market data was successfully loaded from at least one source
         by looking for historical_prices tool results in the conversation.
         """
-        # Look for loaded data sources in tool results
-        loaded_sources = []
-        unavailable_sources = []
-        resolved_symbol = None
-        for message in messages:
-            if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
-                try:
-                    tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
-                    if isinstance(tool_result, dict) and tool_result.get("dates") and tool_result.get("source"):
-                        loaded_sources.append(tool_result["source"])
-                        if not resolved_symbol and tool_result.get("symbol"):
-                            resolved_symbol = tool_result["symbol"]
-                    elif isinstance(tool_result, dict) and tool_result.get("market_data_available") is False:
-                        source = str(tool_result.get("source", "")).strip().casefold()
-                        reason = str(tool_result.get("error", "source unavailable")).strip()
-                        if source:
-                            unavailable_sources.append({"source": source, "reason": reason})
-                except (json.JSONDecodeError, KeyError):
-                    continue
-
-        if not unavailable_sources:
-            unavailable_sources = self._extract_unavailable_market_sources_from_messages(messages)
-
         original_request = self._extract_original_request_from_messages(messages)
         final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
+
+        loaded_sources, unavailable_sources, resolved_symbol = self._extract_market_source_context_from_messages(messages)
+        if not unavailable_sources:
+            unavailable_sources = self._extract_unavailable_market_sources_from_messages(messages)
 
         if not resolved_symbol:
             resolved_symbol = self._extract_symbol_candidate_from_text(final_text)
         if not resolved_symbol:
             resolved_symbol = self._extract_symbol_candidate_from_text(original_request)
 
-        if not loaded_sources:
-            loaded_sources = self._extract_sources_from_text(final_text)
-        if not loaded_sources:
-            loaded_sources = self._extract_sources_from_text(original_request)
+        candidate_sources = list(
+            dict.fromkeys(
+                self._extract_available_sources_from_messages(messages)
+                + self._extract_sources_from_text(final_text)
+                + self._extract_sources_from_text(original_request)
+                + list(SOURCES)
+            )
+        )
+
+        start_date = None
+        end_date = None
+        for text in (original_request, final_text, " ".join(message.get("content", "") for message in messages if message.get("role") == "user")):
+            try:
+                extracted = extract_date_range(text)
+            except ValueError:
+                extracted = None
+            if extracted is not None:
+                start_date, end_date = extracted
+                break
+
+        if resolved_symbol and start_date and end_date:
+            self._deterministically_load_market_sources(
+                agent,
+                messages,
+                iteration,
+                resolved_symbol,
+                start_date,
+                end_date,
+                candidate_sources,
+                loaded_sources,
+            )
+            loaded_sources, unavailable_sources, resolved_symbol_from_context = self._extract_market_source_context_from_messages(messages)
+            if not resolved_symbol and resolved_symbol_from_context:
+                resolved_symbol = resolved_symbol_from_context
         if not loaded_sources and resolved_symbol:
-            # Deterministic fallback: proceed with known universe when the model
-            # summarized success but omitted explicit tool calls.
-            loaded_sources = ["yahoo", "bloomberg", "reuters"]
+            loaded_sources = candidate_sources
             logger.warning(
-                "market_sources_recovered mode=deterministic symbol=%s sources=%s reason=final_answer_without_tool_results",
+                "market_sources_recovered mode=deterministic symbol=%s sources=%s reason=source_list_known_without_tool_results",
                 resolved_symbol,
                 loaded_sources,
             )
@@ -1598,6 +2181,56 @@ class TimeSeriesConstructionProcessor:
             f"market_to_quality symbol={resolved_symbol or 'unknown'} sources={','.join(loaded_sources)}",
         )
 
+        quality_sources: list[dict[str, Any]] = []
+        historical_payloads: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                continue
+            try:
+                payload = json.loads(message["content"].replace("Tool result: ", "", 1))
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(payload, dict)
+                and payload.get("source")
+                and isinstance(payload.get("dates"), list)
+                and isinstance(payload.get("prices"), list)
+            ):
+                source_key = str(payload.get("source", "")).strip().casefold()
+                if source_key and source_key not in historical_payloads:
+                    historical_payloads[source_key] = payload
+
+        quality_tool = get_tool("check_data_quality")
+        if quality_tool is not None:
+            for source in loaded_sources:
+                source_key = str(source).strip().casefold()
+                if not source_key:
+                    continue
+                tool_args: dict[str, Any]
+                payload = historical_payloads.get(source_key)
+                if payload is not None:
+                    tool_args = {"data": payload}
+                else:
+                    tool_args = {"source": source_key, "symbol": resolved_symbol or "UNKNOWN"}
+                    if start_date:
+                        tool_args["start_date"] = start_date
+                    if end_date:
+                        tool_args["end_date"] = end_date
+                try:
+                    quality_result = quality_tool.invoke(tool_args)
+                except Exception:
+                    continue
+                if isinstance(quality_result, dict) and quality_result.get("source"):
+                    quality_sources.append(quality_result)
+
+        data_quality_report = self._build_data_quality_report(
+            quality_sources or [
+                {"source": source, "symbol": resolved_symbol or "UNKNOWN", "note": "fallback_context_only"}
+                for source in loaded_sources
+            ],
+            unavailable_sources=unavailable_sources,
+        )
+
         continuation_events = [
             CallbackEvent(
                 CallbackEventType.AGENT_COMPLETED,
@@ -1607,6 +2240,7 @@ class TimeSeriesConstructionProcessor:
                         "delegated_to": quality_agent.name,
                         "loaded_sources": loaded_sources,
                         "unavailable_sources": unavailable_sources,
+                        "data_quality_report": data_quality_report,
                     },
                 },
                 self.handler.session_id,
@@ -1642,56 +2276,54 @@ class TimeSeriesConstructionProcessor:
     ) -> list[CallbackEvent] | None:
         """Auto-delegate from DataQualityAgent to ReportingAgent after quality checks.
 
-        Checks if quality metrics were computed for at least one source
-        by looking for check_data_quality tool results in the conversation.
+        Ensures every discovered market source is represented in the quality report,
+        even when the model only checked the first source it noticed.
         """
-        # Look for quality check results in tool results
-        quality_sources = []
+        quality_sources: list[dict[str, Any]] = []
         unavailable_sources = self._extract_unavailable_market_sources_from_messages(messages)
+        historical_payloads: dict[str, dict[str, Any]] = {}
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
                 try:
                     tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
-                    if isinstance(tool_result, dict) and "completeness_pct" in tool_result and tool_result.get("source"):
+                    if not isinstance(tool_result, dict):
+                        continue
+                    if tool_result.get("source") and "completeness_pct" in tool_result:
                         quality_sources.append(tool_result)
+                    if (
+                        tool_result.get("source")
+                        and isinstance(tool_result.get("dates"), list)
+                        and isinstance(tool_result.get("prices"), list)
+                    ):
+                        source_key = str(tool_result.get("source", "")).strip().casefold()
+                        if source_key and source_key not in historical_payloads:
+                            historical_payloads[source_key] = tool_result
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-        if not quality_sources:
-            # Fallback: compute quality metrics deterministically even when the
-            # model omitted explicit check_data_quality tool calls.
-            original_request = self._extract_original_request_from_messages(messages)
-            symbol_guess = self._extract_symbol_candidate_from_text(response)
-            if not symbol_guess:
-                symbol_guess = self._extract_symbol_candidate_from_text(original_request)
+        original_request = self._extract_original_request_from_messages(messages)
+        symbol_guess = self._extract_symbol_candidate_from_text(response)
+        if not symbol_guess:
+            symbol_guess = self._extract_symbol_candidate_from_text(original_request)
 
-            # Prefer historical payloads already present in context.
-            historical_payloads: dict[str, dict[str, Any]] = {}
-            for message in messages:
-                if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
-                    continue
-                try:
-                    parsed = json.loads(message["content"].replace("Tool result: ", "", 1))
-                except json.JSONDecodeError:
-                    continue
-                if (
-                    isinstance(parsed, dict)
-                    and parsed.get("source")
-                    and isinstance(parsed.get("dates"), list)
-                    and isinstance(parsed.get("prices"), list)
-                ):
-                    source_key = str(parsed.get("source", "")).strip().casefold()
-                    if source_key and source_key not in historical_payloads:
-                        historical_payloads[source_key] = parsed
+        candidate_sources = list(
+            dict.fromkeys(
+                list(historical_payloads.keys())
+                + self._extract_available_sources_from_messages(messages)
+                + self._extract_sources_from_text(response)
+                + self._extract_sources_from_text(original_request)
+                + list(SOURCES)
+            )
+        )
 
-            candidate_sources = list(historical_payloads.keys())
-            if not candidate_sources:
-                candidate_sources = self._extract_sources_from_text(response)
-            if not candidate_sources:
-                candidate_sources = self._extract_sources_from_text(original_request)
-            if not candidate_sources:
-                candidate_sources = ["yahoo", "bloomberg", "reuters"]
+        known_quality_sources = {
+            str(item.get("source", "")).strip().casefold()
+            for item in quality_sources
+            if item.get("source")
+        }
+        missing_sources = [source for source in candidate_sources if source not in known_quality_sources]
 
+        if missing_sources:
             start_date = None
             end_date = None
             try:
@@ -1702,10 +2334,8 @@ class TimeSeriesConstructionProcessor:
                 start_date, end_date = extracted
 
             quality_tool = get_tool("check_data_quality")
-            recovered_quality_sources: list[dict[str, Any]] = []
-
             if quality_tool is not None:
-                for source in candidate_sources:
+                for source in missing_sources:
                     source_key = str(source).strip().casefold()
                     if not source_key:
                         continue
@@ -1727,7 +2357,8 @@ class TimeSeriesConstructionProcessor:
                     except Exception:
                         continue
                     if isinstance(quality_result, dict) and quality_result.get("source"):
-                        recovered_quality_sources.append(quality_result)
+                        quality_sources.append(quality_result)
+                        known_quality_sources.add(source_key)
                         self.handler.add_trace_record(
                             "tool_call",
                             {
@@ -1749,17 +2380,15 @@ class TimeSeriesConstructionProcessor:
                             iteration=iteration,
                         )
 
-            if recovered_quality_sources:
-                quality_sources = recovered_quality_sources
-            else:
-                quality_sources = [
-                    {
-                        "source": source,
-                        "symbol": symbol_guess or "UNKNOWN",
-                        "note": "fallback_context_only",
-                    }
-                    for source in candidate_sources
-                ]
+        if not quality_sources:
+            quality_sources = [
+                {
+                    "source": source,
+                    "symbol": symbol_guess or "UNKNOWN",
+                    "note": "fallback_context_only",
+                }
+                for source in candidate_sources
+            ]
             logger.warning(
                 "quality_metrics_recovered mode=deterministic symbol=%s reason=final_answer_without_tool_results",
                 symbol_guess,
@@ -1827,14 +2456,37 @@ class TimeSeriesConstructionProcessor:
                 self.handler.session_id,
             ),
         ]
-
-        target_result = self._run_agent(
-            reporting_agent,
-            [{"role": "user", "content": transfer_request}],
-            visited=visited.copy(),
+        prompt, options = self._build_reporting_selection_prompt(quality_sources)
+        awaiting_event = CallbackEvent(
+            CallbackEventType.AWAITING_USER_INPUT,
+            {
+                "prompt": prompt,
+                "agent": reporting_agent.name,
+                "options": options,
+                "context": {
+                    "quality_rows": quality_sources,
+                    "checkpoint": "source_selection",
+                    "data_quality_report": quality_report,
+                },
+            },
+            self.handler.session_id,
+        )
+        # Keep runtime pause state in sync when emitting the event directly.
+        self.handler.current_agent = reporting_agent.name
+        self.handler.waiting_for_input = True
+        self.handler.paused_state = {
+            "agent": reporting_agent.name,
+            "messages": messages.copy(),
+            "iteration": iteration + 1,
+            "checkpoint": "source_selection",
+        }
+        logger.info(
+            "quality_report_pause mode=deterministic agent=%s sources=%d reason=source_selection_prompt_emitted",
+            reporting_agent.name,
+            len(quality_sources),
         )
 
-        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+        return continuation_events + [awaiting_event]
 
     def _continue_reporting_to_gapfilling(
         self,
@@ -1862,26 +2514,19 @@ class TimeSeriesConstructionProcessor:
             )
             return None
 
-        # Check if the final answer or explicit user response contains a source selection
-        final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
-
-        # Look for a selected source in the conversation
+        # Only continue automatically after an explicit source-selection marker
+        # that is injected by process_user_response checkpoint handling.
         selected_source = None
         resolved_symbol = None
-
-        # If not found in paused state, only inspect the latest user message
-        # (explicit response after prompt). Do not scan all history because
-        # transfer/context messages may contain all source names.
-        if not selected_source:
-            last_user_message = next(
-                (msg.get("content", "") for msg in reversed(messages) if msg.get("role") == "user"),
-                "",
-            )
-            selected_source = self._extract_explicit_source_selection(last_user_message)
-
-        # Also check final answer if the model explicitly states one selected source.
-        if not selected_source:
-            selected_source = self._extract_explicit_source_selection(final_text)
+        for message in reversed(messages):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if not content.startswith("[SOURCE_SELECTION]"):
+                continue
+            selected_source = self._extract_explicit_source_selection(content)
+            if selected_source:
+                break
 
         if not selected_source:
             self._log_continuation_decision(
@@ -1971,13 +2616,36 @@ class TimeSeriesConstructionProcessor:
             ),
         ]
 
-        target_result = self._run_agent(
-            gap_agent,
-            [{"role": "user", "content": transfer_request}],
-            visited=visited.copy(),
+        gap_method_options = self._extract_gap_method_options_from_messages(messages)
+        gap_method_prompt = self._build_gap_method_prompt(gap_method_options)
+        awaiting_event = CallbackEvent(
+            CallbackEventType.AWAITING_USER_INPUT,
+            {
+                "prompt": gap_method_prompt,
+                "agent": gap_agent.name,
+                "options": gap_method_options,
+                "context": {
+                    "checkpoint": "gap_method_selection",
+                    "selected_source": selected_source,
+                    "symbol": resolved_symbol,
+                },
+            },
+            self.handler.session_id,
         )
-
-        return continuation_events + (target_result if self._is_event_list(target_result) else [])
+        self.handler.current_agent = gap_agent.name
+        self.handler.waiting_for_input = True
+        self.handler.paused_state = {
+            "agent": gap_agent.name,
+            "messages": messages.copy() + [{"role": "user", "content": f"[SOURCE_SELECTION] {selected_source}"}],
+            "iteration": iteration + 1,
+            "checkpoint": "gap_method_selection",
+        }
+        logger.info(
+            "gapfilling_method_pause mode=deterministic agent=%s options=%s reason=reporting_selected_source_requires_method_selection",
+            gap_agent.name,
+            gap_method_options,
+        )
+        return continuation_events + [awaiting_event]
 
     def _continue_gapfilling_to_construction(
         self,
@@ -1992,14 +2660,15 @@ class TimeSeriesConstructionProcessor:
         Checks if a gap-filling method was applied by looking for apply_gap_filling
         tool results in the conversation.
         """
-        # Look for gap-filling results in tool results
+        # Look for gap-filling results in tool results (data_ref + metadata,
+        # since the full filled series is stored in the DataStore).
         filled_data = None
         final_text = response.split("Final Answer:", 1)[1].strip() if "Final Answer:" in response else response
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
                 try:
                     tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
-                    if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("prices"):
+                    if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("data_ref"):
                         filled_data = tool_result
                         break
                 except (json.JSONDecodeError, KeyError):
@@ -2012,8 +2681,6 @@ class TimeSeriesConstructionProcessor:
                 "",
             )
             selected_method = self._extract_explicit_gap_method(last_user_message)
-            if not selected_method:
-                selected_method = self._extract_explicit_gap_method(final_text)
 
             if selected_method:
                 recovered_prices = self._recover_gapfilling_prices_from_context(
@@ -2111,10 +2778,20 @@ class TimeSeriesConstructionProcessor:
         original_match = re.search(r"original_request=(.+)", all_user_text)
         original_request = original_match.group(1).strip() if original_match else all_user_text
 
+        # Pass only data_ref and metadata – never the full filled series payload.
+        # The TimeSeriesConstructionAgent loads the full series from the DataStore
+        # via build_timeseries/visualize_timeseries using the data_ref.
+        filled_ref = filled_data.get("data_ref")
+        filled_meta = {
+            "data_ref": filled_ref,
+            "symbol": filled_data.get("symbol"),
+            "source": filled_data.get("source"),
+            "method": filled_data.get("method"),
+        }
         transfer_request = (
             f"Build and persist the final time series for {filled_data.get('symbol', 'the instrument')} "
             f"using {filled_data.get('method', 'the selected')} gap-filling method. "
-            f"Filled data: {json.dumps(filled_data)}. "
+            f"Filled data: {json.dumps(filled_meta)}. "
             f"Original request: {original_request}"
         )
 
@@ -2160,7 +2837,12 @@ class TimeSeriesConstructionProcessor:
 
     @staticmethod
     def _extract_prices_payload_from_messages(messages: list[dict[str, str]]) -> dict[str, Any] | None:
-        """Extract a price series payload (dates/prices/symbol) from conversation context."""
+        """Extract a price series reference (data_ref + metadata) from conversation context.
+
+        Returns a compact dict with ``data_ref``, ``symbol``, ``source``, and
+        summary metadata – never the full dates/prices arrays.  The full series
+        is loaded from the DataStore on demand by downstream tools.
+        """
         for message in messages:
             if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
                 continue
@@ -2170,8 +2852,13 @@ class TimeSeriesConstructionProcessor:
                 continue
             if not isinstance(parsed, dict):
                 continue
-            if parsed.get("dates") and parsed.get("prices") and parsed.get("symbol"):
-                return parsed
+            if parsed.get("data_ref") and parsed.get("symbol"):
+                return {
+                    "data_ref": parsed["data_ref"],
+                    "symbol": parsed.get("symbol"),
+                    "source": parsed.get("source"),
+                    "summary": parsed.get("summary"),
+                }
         return None
 
     def _recover_gapfilling_prices_from_context(
@@ -2182,11 +2869,30 @@ class TimeSeriesConstructionProcessor:
         """Recover missing prices for deterministic gap-filling continuation.
 
         Priority:
-        1) Existing tool result payload in current context.
+        1) Existing tool result data_ref in current context (loads from DataStore).
         2) Deterministic historical_prices retrieval from symbol/source/date range.
         """
         direct_payload = self._extract_prices_payload_from_messages(messages)
         if direct_payload is not None:
+            # If we have a data_ref, load the full series from the DataStore
+            # so the apply_gap_filling tool can operate on it.
+            data_ref = direct_payload.get("data_ref")
+            if data_ref:
+                try:
+                    loaded = _get_data_store().get_timeseries(data_ref)
+                    logger.info(
+                        "gapfilling_price_recovered_from_store data_ref=%s symbol=%s source=%s",
+                        data_ref,
+                        loaded.get("symbol"),
+                        loaded.get("source"),
+                    )
+                    return loaded
+                except KeyError as error:
+                    logger.warning(
+                        "gapfilling_price_recovery_store_miss data_ref=%s error=%s",
+                        data_ref,
+                        error,
+                    )
             return direct_payload
 
         user_texts = [
@@ -2203,6 +2909,8 @@ class TimeSeriesConstructionProcessor:
         )
 
         selected_source = self._extract_explicit_source_selection(all_user_text)
+        if not selected_source:
+            selected_source = self._extract_selected_source_marker_from_messages(messages)
         if not selected_source:
             selected_source = self._extract_explicit_source_selection(final_text)
         if not selected_source:
@@ -2298,15 +3006,25 @@ class TimeSeriesConstructionProcessor:
 
     @staticmethod
     def _extract_filled_data_from_messages(messages: list[dict[str, str]]) -> dict[str, Any] | None:
-        """Extract filled series payload from tool results or transfer context."""
+        """Extract filled series reference (data_ref + metadata) from tool results or transfer context.
+
+        Returns a compact dict with ``data_ref``, ``symbol``, ``source``, and
+        ``method`` – never the full filled dates/prices arrays.  The full series
+        is loaded from the DataStore on demand by downstream tools.
+        """
         for message in messages:
             if message.get("role") == "user" and "Tool result:" in message.get("content", ""):
                 try:
                     tool_result = json.loads(message["content"].replace("Tool result: ", "", 1))
                 except json.JSONDecodeError:
                     continue
-                if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("prices"):
-                    return tool_result
+                if isinstance(tool_result, dict) and tool_result.get("method") and tool_result.get("data_ref"):
+                    return {
+                        "data_ref": tool_result["data_ref"],
+                        "symbol": tool_result.get("symbol"),
+                        "source": tool_result.get("source"),
+                        "method": tool_result.get("method"),
+                    }
 
         for message in messages:
             if message.get("role") != "user":
@@ -2323,8 +3041,13 @@ class TimeSeriesConstructionProcessor:
                 parsed = json.loads(match.group(1))
             except json.JSONDecodeError:
                 continue
-            if isinstance(parsed, dict) and parsed.get("prices"):
-                return parsed
+            if isinstance(parsed, dict) and parsed.get("data_ref") and parsed.get("method"):
+                return {
+                    "data_ref": parsed["data_ref"],
+                    "symbol": parsed.get("symbol"),
+                    "source": parsed.get("source"),
+                    "method": parsed.get("method"),
+                }
         return None
 
     @staticmethod
@@ -2381,16 +3104,55 @@ class TimeSeriesConstructionProcessor:
         filled_data = self._extract_filled_data_from_messages(messages)
         csv_path, chart_path = self._extract_artifact_paths_from_messages(messages)
 
+        # If we only have a data_ref (not the full series), load the full
+        # filled series from the DataStore so build/visualize can operate.
+        if filled_data is not None and filled_data.get("data_ref") and not filled_data.get("prices"):
+            try:
+                loaded_filled = _get_data_store().get_gap_filled_series(filled_data["data_ref"])
+                filled_data = {
+                    "data_ref": filled_data["data_ref"],
+                    "symbol": loaded_filled.get("symbol"),
+                    "source": loaded_filled.get("source"),
+                    "method": loaded_filled.get("method"),
+                    "dates": loaded_filled.get("filled_dates"),
+                    "prices": loaded_filled.get("filled_prices"),
+                    "original_dates": loaded_filled.get("original_dates"),
+                    "original_prices": loaded_filled.get("original_prices"),
+                }
+                logger.info(
+                    "construction_filled_data_loaded_from_store data_ref=%s symbol=%s method=%s",
+                    filled_data["data_ref"],
+                    filled_data.get("symbol"),
+                    filled_data.get("method"),
+                )
+            except KeyError as error:
+                logger.warning(
+                    "construction_filled_data_store_miss data_ref=%s error=%s",
+                    filled_data.get("data_ref"),
+                    error,
+                )
+
         if filled_data is not None:
+            # The tools load data from the database using identifiers.
+            # Pass data_ref (or symbol+source) – never the full payload.
+            filled_ref = filled_data.get("data_ref")
+            filled_symbol = filled_data.get("symbol")
+            filled_source = filled_data.get("source")
+
             if not csv_path:
                 build_tool = get_tool("build_timeseries")
                 if build_tool is None:
                     return None
-                build_args = {
-                    "series": filled_data,
+                build_args: dict[str, Any] = {
                     "filename": "final_timeseries.csv",
                     "run_id": self.handler.session_id,
                 }
+                if filled_ref:
+                    build_args["data_ref"] = filled_ref
+                if filled_symbol:
+                    build_args["symbol"] = filled_symbol
+                if filled_source:
+                    build_args["source"] = filled_source
                 try:
                     csv_result = build_tool.invoke(build_args)
                 except Exception as error:
@@ -2423,11 +3185,16 @@ class TimeSeriesConstructionProcessor:
                 if visualize_tool is None:
                     return None
                 title_symbol = str(filled_data.get("symbol") or "Instrument")
-                visual_args = {
-                    "prices": filled_data,
+                visual_args: dict[str, Any] = {
                     "title": f"{title_symbol} continuous time series",
                     "run_id": self.handler.session_id,
                 }
+                if filled_ref:
+                    visual_args["data_ref"] = filled_ref
+                if filled_symbol:
+                    visual_args["symbol"] = filled_symbol
+                if filled_source:
+                    visual_args["source"] = filled_source
                 try:
                     chart_result = visualize_tool.invoke(visual_args)
                 except Exception as error:
@@ -2569,6 +3336,55 @@ class TimeSeriesConstructionProcessor:
                         name,
                         inferred_query,
                     )
+        if name == "generate_report" and "data" not in args:
+            quality_rows = self._extract_quality_rows_from_messages(messages)
+            if quality_rows:
+                args["data"] = quality_rows
+                logger.info(
+                    "tool_arg_recovered agent=%s tool=%s source=quality_context rows=%d",
+                    agent.name,
+                    name,
+                    len(quality_rows),
+                )
+            else:
+                report_payload = {
+                    key: value
+                    for key, value in args.items()
+                    if key not in {"filename", "run_id", "data"}
+                }
+                if report_payload:
+                    args["data"] = report_payload
+                    logger.warning(
+                        "tool_arg_recovered agent=%s tool=%s source=raw_arguments keys=%s reason=missing_quality_context",
+                        agent.name,
+                        name,
+                        sorted(report_payload.keys()),
+                    )
+        if name == "historical_prices" and "source" not in args:
+            # Recover missing source from conversation context
+            all_user_text = " ".join(
+                msg.get("content", "")
+                for msg in messages
+                if msg.get("role") == "user"
+            )
+            for known_source in ("yahoo", "bloomberg", "reuters"):
+                if known_source in all_user_text.casefold():
+                    args["source"] = known_source
+                    logger.info(
+                        "tool_arg_recovered agent=%s tool=%s source=user_context recovered_source=%s",
+                        agent.name,
+                        name,
+                        known_source,
+                    )
+                    break
+            if "source" not in args:
+                # Last resort: default to yahoo
+                args["source"] = "yahoo"
+                logger.warning(
+                    "tool_arg_recovered agent=%s tool=%s source=default recovered_source=yahoo reason=no_source_in_context",
+                    agent.name,
+                    name,
+                )
         logger.info(
             "tool_started agent=%s tool=%s iteration=%d", agent.name, name, iteration,
         )
@@ -2754,52 +3570,34 @@ class TimeSeriesConstructionProcessor:
             if recovered_filled_data is not None:
                 payload_key = "series" if name == "build_timeseries" else "prices"
                 payload_value = args.get(payload_key)
-                if not isinstance(payload_value, dict) or (
-                    isinstance(recovered_filled_data.get("prices"), list)
-                    and len(recovered_filled_data.get("prices", [])) >= len(payload_value.get("prices", []))
-                ):
-                    merged_payload = dict(recovered_filled_data)
-                    if isinstance(payload_value, dict):
-                        for key, value in payload_value.items():
-                            if key not in {
-                                "dates",
-                                "prices",
-                                "filled_dates",
-                                "filled_prices",
-                                "original_dates",
-                                "original_prices",
-                                "method",
-                                "gap_filling_method",
-                            }:
-                                merged_payload.setdefault(key, value)
-                    args[payload_key] = merged_payload
-                    logger.info(
-                        "tool_arg_recovered agent=%s tool=%s source=filled_context symbol=%s method=%s",
-                        agent.name,
-                        name,
-                        merged_payload.get("symbol"),
-                        merged_payload.get("method"),
-                    )
-            self.handler.request_human_input(
-                args.get("prompt", "Please choose an option."),
-                args.get("options"),
-                args.get("context"),
-            )
-            self.handler.paused_state = {
-                "agent": agent.name,
-                "messages": messages.copy(),
-                "iteration": iteration + 1,
-                "checkpoint": "gap_method_selection",
-            }
-            logger.info("agent_paused agent=%s iteration=%d", agent.name, iteration)
-            self._debug_flow_event(
-                component="processor",
-                stage="pause",
-                agent=agent.name,
-                iteration=iteration,
-                detail=f"tool={name}",
-            )
-            return None
+
+                # The tools now load data from the database using identifiers.
+                # Pass data_ref (or symbol+source) so the tool can resolve the
+                # full series from the DataStore – never pass the full payload.
+                data_ref = recovered_filled_data.get("data_ref")
+                symbol = recovered_filled_data.get("symbol") or args.get("symbol")
+                source = recovered_filled_data.get("source") or args.get("source")
+
+                if data_ref and not args.get("data_ref"):
+                    args["data_ref"] = data_ref
+                if symbol and not args.get("symbol"):
+                    args["symbol"] = symbol
+                if source and not args.get("source"):
+                    args["source"] = source
+
+                # Remove any inline payload dicts so the tool always loads
+                # from the database.
+                if payload_key in args and not isinstance(args[payload_key], dict):
+                    args.pop(payload_key, None)
+
+                logger.info(
+                    "tool_arg_recovered agent=%s tool=%s source=filled_context data_ref=%s symbol=%s method=%s",
+                    agent.name,
+                    name,
+                    data_ref,
+                    symbol,
+                    recovered_filled_data.get("method"),
+                )
 
         if name == "delegate_to_agent":
             target_name = str(args.get("agent_name", "")).strip()
@@ -2843,6 +3641,31 @@ class TimeSeriesConstructionProcessor:
                 )
                 return {"error": "Unknown target agent."}
 
+            if target.name == agent.name:
+                logger.warning(
+                    "agent_self_delegation_recovered mode=deterministic agent=%s target=%s reason=self_delegate_tool_call",
+                    agent.name,
+                    target.name,
+                )
+                if agent.name == "TimeSeriesConstructionAgent":
+                    # Construction can receive stale self-delegation actions when
+                    # upstream deterministic recovery skips intermediate LLM turns.
+                    # Treat as no-op and continue iterating within the same agent.
+                    return {
+                        "status": "skipped_self_delegation",
+                        "agent": agent.name,
+                    }
+                continuation = self._continue_after_agent_completion(
+                    response="",
+                    agent=agent,
+                    messages=messages,
+                    iteration=iteration,
+                    visited=visited,
+                )
+                if continuation is not None:
+                    return continuation
+                return {"error": f"Self-delegation is not allowed for {agent.name}."}
+
             if (
                 agent.name == "GapFillingAgent"
                 and target.name == "TimeSeriesConstructionAgent"
@@ -2873,6 +3696,155 @@ class TimeSeriesConstructionProcessor:
             ):
                 delegated_request = f"{_REPORTING_FINAL_SUMMARY_NOTE} {delegated_request}".strip()
 
+            if agent.name == "DataQualityAgent" and target.name == "ReportingAgent":
+                quality_rows = self._extract_quality_rows_from_messages(messages)
+                original_request = self._extract_original_request_from_messages(messages)
+                candidate_sources = list(
+                    dict.fromkeys(
+                        self._extract_available_sources_from_messages(messages)
+                        + self._extract_sources_from_text(original_request)
+                        + list(SOURCES)
+                    )
+                )
+
+                known_quality_sources = {
+                    str(item.get("source", "")).strip().casefold()
+                    for item in quality_rows
+                    if item.get("source")
+                }
+                missing_sources = [source for source in candidate_sources if source not in known_quality_sources]
+                if missing_sources:
+                    historical_payloads: dict[str, dict[str, Any]] = {}
+                    for message in messages:
+                        if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                            continue
+                        try:
+                            parsed = json.loads(message["content"].replace("Tool result: ", "", 1))
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            isinstance(parsed, dict)
+                            and parsed.get("source")
+                            and isinstance(parsed.get("dates"), list)
+                            and isinstance(parsed.get("prices"), list)
+                        ):
+                            source_key = str(parsed.get("source", "")).strip().casefold()
+                            if source_key and source_key not in historical_payloads:
+                                historical_payloads[source_key] = parsed
+
+                    original_request = self._extract_original_request_from_messages(messages)
+                    symbol_guess = self._extract_symbol_candidate_from_text(original_request)
+                    if not symbol_guess:
+                        symbol_guess = self._extract_symbol_candidate_from_text(" ".join(
+                            msg.get("content", "") for msg in messages if msg.get("role") == "user"
+                        ))
+                    start_date = None
+                    end_date = None
+                    try:
+                        extracted = extract_date_range(original_request)
+                    except ValueError:
+                        extracted = None
+                    if extracted is not None:
+                        start_date, end_date = extracted
+
+                    quality_tool = get_tool("check_data_quality")
+                    if quality_tool is not None:
+                        for source in missing_sources:
+                            source_key = str(source).strip().casefold()
+                            if not source_key:
+                                continue
+                            tool_args: dict[str, Any]
+                            payload = historical_payloads.get(source_key)
+                            if payload is not None:
+                                tool_args = {"data": payload}
+                            else:
+                                tool_args = {"source": source_key, "symbol": symbol_guess or "UNKNOWN"}
+                                if start_date:
+                                    tool_args["start_date"] = start_date
+                                if end_date:
+                                    tool_args["end_date"] = end_date
+                            try:
+                                quality_result = quality_tool.invoke(tool_args)
+                            except Exception:
+                                continue
+                            if isinstance(quality_result, dict) and quality_result.get("source"):
+                                quality_rows.append(quality_result)
+
+                quality_report = self._build_data_quality_report(
+                    quality_rows or [
+                        {"source": source, "symbol": self._extract_symbol_candidate_from_text(self._extract_original_request_from_messages(messages)) or "UNKNOWN", "note": "fallback_context_only"}
+                        for source in candidate_sources
+                    ],
+                    unavailable_sources=self._extract_unavailable_market_sources_from_messages(messages),
+                )
+
+                logger.info(
+                    "quality_auto_continue mode=deterministic to_agent=%s sources=%d reason=dataquality_delegated_to_reporting",
+                    target.name,
+                    len(quality_report.get("rows", []) or []),
+                )
+                self._log_continuation_decision(
+                    agent.name,
+                    iteration,
+                    "delegating",
+                    f"quality_to_reporting sources={len(quality_report.get('rows', []) or [])}",
+                )
+                continuation_events = [
+                    CallbackEvent(
+                        CallbackEventType.AGENT_COMPLETED,
+                        {
+                            "agent": agent.name,
+                            "result": {
+                                "delegated_to": target.name,
+                                "data_quality_report": quality_report,
+                            },
+                        },
+                        self.handler.session_id,
+                    ),
+                    CallbackEvent(
+                        CallbackEventType.DELEGATED,
+                        {
+                            "from_agent": agent.name,
+                            "to_agent": target.name,
+                            "request": delegated_request,
+                            "routing_mode": "deterministic",
+                            "routing_reason": "bypassed user prompt: DataQualityAgent completed with quality metrics, auto-delegating to ReportingAgent",
+                        },
+                        self.handler.session_id,
+                    ),
+                ]
+
+                prompt, options = self._build_reporting_selection_prompt(quality_report.get("rows", []) or [])
+                awaiting_event = CallbackEvent(
+                    CallbackEventType.AWAITING_USER_INPUT,
+                    {
+                        "prompt": prompt,
+                        "agent": target.name,
+                        "options": options,
+                        "context": {
+                            "quality_rows": quality_report.get("rows", []) or [],
+                            "checkpoint": "source_selection",
+                            "data_quality_report": quality_report,
+                        },
+                    },
+                    self.handler.session_id,
+                )
+                # Keep runtime pause state in sync when emitting the event directly.
+                self.handler.current_agent = target.name
+                self.handler.waiting_for_input = True
+                self.handler.paused_state = {
+                    "agent": target.name,
+                    "messages": messages.copy(),
+                    "iteration": iteration + 1,
+                    "checkpoint": "source_selection",
+                }
+                logger.info(
+                    "quality_report_pause mode=deterministic agent=%s sources=%d reason=dataquality_direct_reporting_pause",
+                    target.name,
+                    len(quality_report.get("rows", []) or []),
+                )
+                return continuation_events + [awaiting_event]
+
             logger.info(
                 "agent_delegated from_agent=%s to_agent=%s",
                 agent.name, target.name,
@@ -2887,6 +3859,99 @@ class TimeSeriesConstructionProcessor:
             completion_result: dict[str, Any] = {"delegated_to": target.name}
             if agent.name == "DataQualityAgent":
                 quality_rows = self._extract_quality_rows_from_messages(messages)
+                original_request = self._extract_original_request_from_messages(messages)
+                candidate_sources = list(
+                    dict.fromkeys(
+                        self._extract_available_sources_from_messages(messages)
+                        + self._extract_sources_from_text(original_request)
+                        + list(SOURCES)
+                    )
+                )
+
+                known_quality_sources = {
+                    str(item.get("source", "")).strip().casefold()
+                    for item in quality_rows
+                    if item.get("source")
+                }
+                missing_sources = [source for source in candidate_sources if source not in known_quality_sources]
+                if missing_sources:
+                    historical_payloads: dict[str, dict[str, Any]] = {}
+                    for message in messages:
+                        if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                            continue
+                        try:
+                            parsed = json.loads(message["content"].replace("Tool result: ", "", 1))
+                        except json.JSONDecodeError:
+                            continue
+                        if (
+                            isinstance(parsed, dict)
+                            and parsed.get("source")
+                            and isinstance(parsed.get("dates"), list)
+                            and isinstance(parsed.get("prices"), list)
+                        ):
+                            source_key = str(parsed.get("source", "")).strip().casefold()
+                            if source_key and source_key not in historical_payloads:
+                                historical_payloads[source_key] = parsed
+
+                    original_request = self._extract_original_request_from_messages(messages)
+                    symbol_guess = self._extract_symbol_candidate_from_text(original_request)
+                    if not symbol_guess:
+                        symbol_guess = self._extract_symbol_candidate_from_text(" ".join(
+                            msg.get("content", "") for msg in messages if msg.get("role") == "user"
+                        ))
+                    start_date = None
+                    end_date = None
+                    try:
+                        extracted = extract_date_range(original_request)
+                    except ValueError:
+                        extracted = None
+                    if extracted is not None:
+                        start_date, end_date = extracted
+
+                    quality_tool = get_tool("check_data_quality")
+                    if quality_tool is not None:
+                        for source in missing_sources:
+                            source_key = str(source).strip().casefold()
+                            if not source_key:
+                                continue
+                            tool_args: dict[str, Any]
+                            payload = historical_payloads.get(source_key)
+                            if payload is not None:
+                                tool_args = {"data": payload}
+                            else:
+                                tool_args = {"source": source_key, "symbol": symbol_guess or "UNKNOWN"}
+                                if start_date:
+                                    tool_args["start_date"] = start_date
+                                if end_date:
+                                    tool_args["end_date"] = end_date
+                            try:
+                                quality_result = quality_tool.invoke(tool_args)
+                            except Exception:
+                                continue
+                            if isinstance(quality_result, dict) and quality_result.get("source"):
+                                quality_rows.append(quality_result)
+                                known_quality_sources.add(source_key)
+                                self.handler.add_trace_record(
+                                    "tool_call",
+                                    {
+                                        "tool": "check_data_quality",
+                                        "description": get_tool_description("check_data_quality"),
+                                        "arguments": tool_args,
+                                    },
+                                    agent=agent.name,
+                                    iteration=iteration,
+                                )
+                                self.handler.add_trace_record(
+                                    "tool_result",
+                                    {
+                                        "tool": "check_data_quality",
+                                        "description": get_tool_description("check_data_quality"),
+                                        "result": quality_result,
+                                    },
+                                    agent=agent.name,
+                                    iteration=iteration,
+                                )
+
                 if quality_rows:
                     completion_result["data_quality_report"] = self._build_data_quality_report(
                         quality_rows
@@ -2947,6 +4012,45 @@ class TimeSeriesConstructionProcessor:
         if tool is None:
             return {"error": f"Unknown tool: {name}"}
 
+        if name == "check_data_quality" and agent.name == "DataQualityAgent":
+            has_data_dict = isinstance(args.get("data"), dict)
+            has_scalar_payload = (
+                isinstance(args.get("prices"), list)
+                and isinstance(args.get("source"), str)
+                and isinstance(args.get("symbol"), str)
+            )
+            if not has_data_dict and not has_scalar_payload:
+                requested_source = str(args.get("source", "")).strip().casefold()
+                historical_payloads: dict[str, dict[str, Any]] = {}
+                for message in messages:
+                    if message.get("role") != "user" or "Tool result:" not in message.get("content", ""):
+                        continue
+                    try:
+                        payload = json.loads(message["content"].replace("Tool result: ", "", 1))
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("source")
+                        and isinstance(payload.get("prices"), list)
+                        and payload.get("symbol")
+                    ):
+                        source_key = str(payload.get("source", "")).strip().casefold()
+                        if source_key and source_key not in historical_payloads:
+                            historical_payloads[source_key] = payload
+
+                recovered_payload = historical_payloads.get(requested_source) if requested_source else None
+                if recovered_payload is None and historical_payloads:
+                    recovered_payload = next(iter(historical_payloads.values()))
+                if recovered_payload is not None:
+                    args["data"] = recovered_payload
+                    logger.warning(
+                        "quality_tool_args_recovered mode=deterministic agent=%s source=%s symbol=%s reason=malformed_check_data_quality_payload",
+                        agent.name,
+                        recovered_payload.get("source"),
+                        recovered_payload.get("symbol"),
+                    )
+
         try:
             result = tool.invoke(args)
             logger.info(
@@ -2973,8 +4077,26 @@ class TimeSeriesConstructionProcessor:
             failure = self._tool_failure(name, result)
             if failure:
                 return [failure]
-            return result
+            # Strip large payloads from results that have a data_ref to avoid
+            # sending full time series data to the LLM (token cost optimization).
+            return self._strip_payload_for_llm(result)
         except Exception as error:
+            if name == "check_data_quality" and agent.name == "DataQualityAgent":
+                continuation = self._continue_quality_to_reporting(
+                    response="",
+                    agent=agent,
+                    messages=messages,
+                    iteration=iteration,
+                    visited=visited,
+                )
+                if continuation is not None:
+                    logger.warning(
+                        "quality_tool_failure_recovered mode=deterministic agent=%s iteration=%d error=%s",
+                        agent.name,
+                        iteration,
+                        str(error),
+                    )
+                    return continuation
             if name == "historical_prices" and agent.name == "MarketDataAgent":
                 source = str(args.get("source", "")).strip().casefold() or "unknown"
                 symbol = str(args.get("symbol", "")).strip() or "unknown"
@@ -3023,9 +4145,45 @@ class TimeSeriesConstructionProcessor:
             return [self._user_error(name, str(error))]
 
     @staticmethod
+    def _strip_payload_for_llm(result: Any) -> Any:
+        """Strip large payloads from tool results before sending to LLM.
+
+        When a tool result contains a ``data_ref`` (meaning the full data is
+        stored in the DataStore), the following large arrays are removed from
+        the payload sent to the LLM to prevent token bloat:
+
+        - ``dates``, ``prices`` (from historical_prices)
+        - ``filled_dates``, ``filled_prices``, ``original_dates``, ``original_prices`` (from apply_gap_filling)
+
+        The LLM still receives the ``data_ref`` which it can pass to downstream
+        tools to load the full data on demand.
+
+        Args:
+            result: The raw tool result (dict or other).
+
+        Returns:
+            The result with large arrays stripped if ``data_ref`` is present.
+        """
+        if isinstance(result, dict) and result.get("data_ref"):
+            stripped = dict(result)
+            stripped.pop("dates", None)
+            stripped.pop("prices", None)
+            stripped.pop("filled_dates", None)
+            stripped.pop("filled_prices", None)
+            stripped.pop("original_dates", None)
+            stripped.pop("original_prices", None)
+            return stripped
+        return result
+
+    @staticmethod
     def _normalize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Accept common LLM aliases while keeping tool schemas explicit."""
         normalized = dict(args)
+        if tool_name == "request_human_input":
+            if "prompt" not in normalized and isinstance(normalized.get("message"), str):
+                normalized["prompt"] = normalized["message"]
+            if "options" not in normalized and isinstance(normalized.get("choices"), list):
+                normalized["options"] = normalized["choices"]
         if tool_name == "get_instrument_details":
             if "query" in normalized and not isinstance(normalized["query"], str):
                 normalized.pop("query", None)
@@ -3034,11 +4192,50 @@ class TimeSeriesConstructionProcessor:
             if "query" not in normalized and "symbol" in normalized:
                 normalized["query"] = normalized["symbol"]
             normalized.setdefault("identifier", "auto")
+        if tool_name == "delegate_to_agent":
+            if "agent_name" not in normalized and "agent" in normalized:
+                normalized["agent_name"] = normalized["agent"]
+            if "agent_name" not in normalized and "delegate_to" in normalized:
+                normalized["agent_name"] = normalized["delegate_to"]
+            if "request" not in normalized and isinstance(normalized.get("input"), str):
+                normalized["request"] = normalized["input"]
+            if "request" not in normalized:
+                hints = {
+                    key: value
+                    for key, value in normalized.items()
+                    if key in {
+                        "instrument_symbol",
+                        "symbol",
+                        "source",
+                        "start_date",
+                        "end_date",
+                        "method",
+                    }
+                }
+                if hints:
+                    normalized["request"] = json.dumps(hints)
         if tool_name == "historical_prices":
+            if "symbol" not in normalized and "instrument_symbol" in normalized:
+                normalized["symbol"] = normalized["instrument_symbol"]
             if "symbol" not in normalized and "ticker" in normalized:
                 normalized["symbol"] = normalized["ticker"]
             if "source" not in normalized and "data_source" in normalized:
                 normalized["source"] = normalized["data_source"]
+            if "source" not in normalized and isinstance(normalized.get("sources"), list):
+                source_list = [str(item).strip().casefold() for item in normalized["sources"] if str(item).strip()]
+                if source_list:
+                    normalized["source"] = source_list[0]
+                    normalized.setdefault("source_candidates", source_list)
+            # Fallback: when source is missing, try to extract from any available context
+            # in the args (e.g. if passed as part of another field).
+            if "source" not in normalized:
+                for candidate_key in ("data", "context", "request"):
+                    candidate = normalized.get(candidate_key)
+                    if isinstance(candidate, str):
+                        for known_source in ("yahoo", "bloomberg", "reuters"):
+                            if known_source in candidate.casefold():
+                                normalized["source"] = known_source
+                                break
             if "start_date" not in normalized:
                 if "from_date" in normalized:
                     normalized["start_date"] = normalized["from_date"]
@@ -3074,9 +4271,26 @@ class TimeSeriesConstructionProcessor:
                 # LLM passed the historical_prices dict as the 'prices' argument
                 hp_dict = normalized.pop("prices")
                 normalized["data"] = hp_dict
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if isinstance(normalized.get("source"), list):
+                source_list = [str(item).strip().casefold() for item in normalized["source"] if str(item).strip()]
+                if source_list:
+                    normalized["source"] = source_list[0]
+                    normalized.setdefault("source_candidates", source_list)
+                else:
+                    normalized.pop("source", None)
+            if "source" not in normalized and isinstance(normalized.get("sources"), list):
+                source_list = [str(item).strip().casefold() for item in normalized["sources"] if str(item).strip()]
+                if source_list:
+                    normalized["source"] = source_list[0]
+                    normalized.setdefault("source_candidates", source_list)
             if "data" not in normalized and "source" in normalized and "prices" not in normalized:
                 # LLM passed source but not prices/symbol - likely a malformed call
                 pass
+            # Support data_ref: if provided, downstream tool will load from DataStore
+            if "data_ref" in normalized and not isinstance(normalized["data_ref"], str):
+                normalized.pop("data_ref", None)
         if tool_name == "build_timeseries":
             if "series" not in normalized and isinstance(normalized.get("prices"), list) and isinstance(normalized.get("dates"), list):
                 normalized["series"] = {
@@ -3091,6 +4305,32 @@ class TimeSeriesConstructionProcessor:
                 if "method" not in series_payload and "gap_filling_method" in series_payload:
                     series_payload["method"] = series_payload.get("gap_filling_method")
                 normalized["series"] = series_payload
+            # Support symbol/source identifiers for database lookups.
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if "source" not in normalized and isinstance(normalized.get("data_source"), str):
+                normalized["source"] = normalized["data_source"]
+            # If a data_ref is present, prefer it over inline series.
+            if normalized.get("data_ref") and "series" in normalized:
+                normalized.pop("series", None)
+        if tool_name == "visualize_timeseries":
+            # Support symbol/source identifiers for database lookups.
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if "source" not in normalized and isinstance(normalized.get("data_source"), str):
+                normalized["source"] = normalized["data_source"]
+            # If a data_ref is present, prefer it over inline prices.
+            if normalized.get("data_ref") and "prices" in normalized:
+                normalized.pop("prices", None)
+        if tool_name == "apply_gap_filling":
+            # Support symbol/source identifiers for database lookups.
+            if "symbol" not in normalized and isinstance(normalized.get("instrument_symbol"), str):
+                normalized["symbol"] = normalized["instrument_symbol"]
+            if "source" not in normalized and isinstance(normalized.get("data_source"), str):
+                normalized["source"] = normalized["data_source"]
+            # If a data_ref is present, prefer it over inline prices.
+            if normalized.get("data_ref") and "prices" in normalized:
+                normalized.pop("prices", None)
         if tool_name in {"extract_requested_date_range", "normalize_requested_dates"}:
             if "request" not in normalized and "text" in normalized:
                 normalized["request"] = normalized["text"]
@@ -3215,10 +4455,20 @@ class TimeSeriesConstructionProcessor:
 
     @staticmethod
     def _parse_calls(text: str) -> list[dict[str, Any]]:
-        """Parse ReACT Action/Action Input blocks from LLM output."""
+        """Parse ReACT Action/Action Input blocks from LLM output.
+
+        Uses a multi-strategy approach to handle different model output styles:
+        1. Strict single-line: ``Action: <name> Action Input: <json>``
+        2. Multi-line: ``Action: <name>`` then ``Action Input: <json>`` on next line(s)
+        3. Code-fenced JSON: ``{"name": "...", "arguments": {...}}``
+        4. Loose JSON: any top-level JSON object with ``name`` and ``arguments`` keys
+        """
         calls: list[dict[str, Any]] = []
+        cleaned_text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+
+        # Strategy 1: Strict single-line ReACT format
         action_matches = list(
-            re.finditer(r"Action:\s*([A-Za-z_]\w*)\s+Action Input:\s*", text)
+            re.finditer(r"Action:\s*([A-Za-z_]\w*)\s+Action Input:\s*", cleaned_text)
         )
         for index, match in enumerate(action_matches):
             name = match.group(1)
@@ -3226,9 +4476,9 @@ class TimeSeriesConstructionProcessor:
             input_end = (
                 action_matches[index + 1].start()
                 if index + 1 < len(action_matches)
-                else len(text)
+                else len(cleaned_text)
             )
-            raw_input = text[input_start:input_end].strip()
+            raw_input = cleaned_text[input_start:input_end].strip()
             raw_input = re.sub(
                 r"^```(?:json|python)?\s*|\s*```$",
                 "",
@@ -3240,6 +4490,88 @@ class TimeSeriesConstructionProcessor:
                 logger.warning("Could not parse tool call for %s", name)
                 continue
             calls.append({"name": name, "arguments": parsed})
+
+        if calls:
+            return calls
+
+        # Strategy 2: Multi-line ReACT format (Action on one line, Action Input on next)
+        multi_line_matches = list(
+            re.finditer(
+                r"Action:\s*([A-Za-z_]\w*)\s*\n\s*Action Input:\s*",
+                cleaned_text,
+                re.MULTILINE,
+            )
+        )
+        for index, match in enumerate(multi_line_matches):
+            name = match.group(1)
+            input_start = match.end()
+            input_end = (
+                multi_line_matches[index + 1].start()
+                if index + 1 < len(multi_line_matches)
+                else len(cleaned_text)
+            )
+            raw_input = cleaned_text[input_start:input_end].strip()
+            raw_input = re.sub(
+                r"^```(?:json|python)?\s*|\s*```$",
+                "",
+                raw_input,
+                flags=re.IGNORECASE | re.DOTALL,
+            ).strip()
+            parsed = TimeSeriesConstructionProcessor._parse_tool_input(raw_input)
+            if parsed is None:
+                logger.warning("Could not parse multi-line tool call for %s", name)
+                continue
+            calls.append({"name": name, "arguments": parsed})
+
+        if calls:
+            return calls
+
+        # Strategy 3: Code-fenced JSON tool call pattern
+        code_fence_matches = list(
+            re.finditer(
+                r"```(?:json)?\s*\n?\s*\{\s*\"name\"\s*:\s*\"([A-Za-z_]\w*)\"",
+                cleaned_text,
+            )
+        )
+        if code_fence_matches:
+            for match in code_fence_matches:
+                name = match.group(1)
+                # Find the closing fence
+                remaining = cleaned_text[match.start():]
+                close_fence = remaining.find("```", 6)
+                json_block = remaining[:close_fence] if close_fence > 0 else remaining
+                json_block = re.sub(
+                    r"^```(?:json)?\s*|\s*```$",
+                    "",
+                    json_block,
+                    flags=re.IGNORECASE | re.DOTALL,
+                ).strip()
+                parsed = TimeSeriesConstructionProcessor._parse_tool_input(json_block)
+                if isinstance(parsed, dict) and parsed.get("name") and parsed.get("arguments"):
+                    calls.append({"name": str(parsed["name"]), "arguments": parsed["arguments"]})
+
+        if calls:
+            return calls
+
+        # Strategy 4: Loose JSON - find any JSON object with name/arguments keys
+        json_decoder = json.JSONDecoder()
+        search_start = 0
+        while search_start < len(cleaned_text):
+            try:
+                parsed, end_pos = json_decoder.raw_decode(cleaned_text, search_start)
+                if isinstance(parsed, dict) and parsed.get("name") and isinstance(parsed.get("arguments"), dict):
+                    calls.append({"name": str(parsed["name"]), "arguments": parsed["arguments"]})
+                elif isinstance(parsed, dict) and parsed.get("action"):
+                    action_name = str(parsed.get("action", "")).strip()
+                    if action_name:
+                        action_input = parsed.get("input", {})
+                        if not isinstance(action_input, dict):
+                            action_input = {"value": action_input}
+                        calls.append({"name": action_name, "arguments": action_input})
+                search_start = end_pos + 1
+            except json.JSONDecodeError:
+                search_start += 1
+
         return calls
 
     @staticmethod
@@ -3254,6 +4586,57 @@ class TimeSeriesConstructionProcessor:
             except (SyntaxError, ValueError):
                 return None
         return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _build_agent_format_override(agent_name: str) -> str:
+        """Build an agent-specific FORMAT_OVERRIDE prompt.
+
+        Local models that produce unparseable ReAct output are given an exact
+        example of the required format. The example must match the agent's
+        on-contract tools so the model is steered back to the correct workflow
+        stage rather than being told to call an off-contract tool (which is
+        what happens when a generic get_instrument_details override is used
+        for every agent).
+        """
+        agent_specific_examples: dict[str, tuple[str, str]] = {
+            "Orchestrator": (
+                "delegate_to_agent",
+                '{"agent_name": "ReferenceDataAgent", "request": "Build AAPL from 2023-01-01 to 2023-12-31"}',
+            ),
+            "ReferenceDataAgent": (
+                "get_instrument_details",
+                '{"query": "AAPL"}',
+            ),
+            "MarketDataAgent": (
+                "historical_prices",
+                '{"symbol": "AAPL", "start_date": "2023-01-01", "end_date": "2023-12-31", "source": "yahoo"}',
+            ),
+            "DataQualityAgent": (
+                "check_data_quality",
+                '{"source": "yahoo", "symbol": "AAPL"}',
+            ),
+            "GapFillingAgent": (
+                "apply_gap_filling",
+                '{"method": "linear_interpolation", "data_ref": "<data_ref_from_previous_tool>"}',
+            ),
+            "TimeSeriesConstructionAgent": (
+                "build_timeseries",
+                '{"filename": "final_timeseries.csv", "data_ref": "<data_ref_from_previous_tool>"}',
+            ),
+            "ReportingAgent": (
+                "generate_report",
+                '{"filename": "quality_report.csv"}',
+            ),
+        }
+        tool_name, tool_example = agent_specific_examples.get(
+            agent_name,
+            ("get_instrument_details", '{"query": "AAPL"}'),
+        )
+        return (
+            "[SYSTEM_NOTE] FORMAT_OVERRIDE: Output exactly this format without any additional text:\n"
+            f"Action: {tool_name}\n"
+            f"Action Input: {tool_example}"
+        )
 
     @staticmethod
     def _prompt(agent: Agent) -> str:

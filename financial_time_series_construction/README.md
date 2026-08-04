@@ -301,6 +301,85 @@ Typical outputs:
 - `workflow_report.json`
 - `workflow_report.txt`
 
+### DataStore Database Schema
+
+The workflow uses a centralised SQLite database stored at:
+
+```
+~/time_series_construction/time_series_database/database/datastore.db
+```
+
+Only one database file exists per output root — all runs share a single store. The schema uses a normalised design with dimension tables and fact tables, tracked via versioned migrations.
+
+#### Dimension Tables
+
+| Table | Purpose | Key Columns |
+|---|---|---|
+| `runs` | Unique run/session identifiers with date bounds | `id`, `run_id` (UNIQUE), `start_date`, `end_date`, `created_at`, `updated_at` |
+| `instruments` | Lookup table of ticker symbols | `id`, `symbol` (UNIQUE), `created_at` |
+| `sources` | Lookup table of data source names (yahoo, bloomberg, reuters) | `id`, `name` (UNIQUE), `created_at` |
+| `migrations` | Schema version tracking for ordered upgrades | `version` (PK), `applied_at` |
+
+#### Fact Tables
+
+| Table | Purpose | Key Columns | Foreign Keys |
+|---|---|---|---|
+| `raw_timeseries` | Original price data loaded from market sources | `data_ref` (PK), `run_id`, `symbol`, `source`, `dates` (JSON), `prices` (JSON), `created_at` | `run_id` → `runs.run_id`, `symbol` → `instruments.symbol`, `source` → `sources.name` |
+| `filled_timeseries` | Gap-filled price data after interpolation | `data_ref` (PK), `run_id`, `symbol`, `source`, `method`, `original_dates` (JSON), `original_prices` (JSON), `filled_dates` (JSON), `filled_prices` (JSON), `original_data_ref`, `created_at` | `run_id` → `runs.run_id`, `symbol` → `instruments.symbol`, `source` → `sources.name`, `original_data_ref` → `raw_timeseries.data_ref` |
+| `quality_reports` | JSON quality metrics per source | `report_id` (PK), `run_id`, `symbol`, `source`, `report` (JSON), `created_at` | `run_id` → `runs.run_id`, `symbol` → `instruments.symbol`, `source` → `sources.name` |
+| `artifacts` | File artifacts (CSV, PNG, reports) produced during a run | `artifact_id` (PK), `run_id`, `symbol`, `source`, `artifact_type`, `path`, `created_at` | `run_id` → `runs.run_id`, `symbol` → `instruments.symbol`, `source` → `sources.name` |
+
+#### Backward-Compatible Views
+
+For legacy code that references the old table names, four SQL views are automatically created:
+
+- `timeseries` → selects from `raw_timeseries`
+- `gap_filled_series` → selects from `filled_timeseries`
+- `run_dates` → selects from `runs`
+- `source_types` → selects from `sources`
+
+#### Singleton Management
+
+The database is opened once per process lifetime via a global singleton:
+
+```python
+from financial_time_series_construction.time_series_construction import (
+    DataStore, get_datastore, init_datastore, reset_datastore, close_datastore,
+)
+
+# Initialise once
+init_datastore(output_root / "time_series_database" / "database" / "datastore.db")
+
+# Use anywhere
+store = get_datastore()
+data_ref = store.put_timeseries("run1", "AAPL", "yahoo", dates, prices)
+```
+
+#### Key Operations
+
+| Method | Description |
+|---|---|
+| `put_timeseries(run_id, symbol, source, dates, prices)` | Store raw price data |
+| `get_timeseries(data_ref)` | Retrieve raw price data |
+| `list_timeseries(run_id, symbol, source)` | List stored raw series |
+| `delete_timeseries(data_ref)` | Remove a raw series |
+| `put_gap_filled_series(...)` | Store gap-filled result |
+| `get_gap_filled_series(data_ref)` | Retrieve gap-filled result |
+| `list_gap_filled_series(run_id, symbol, source)` | List stored filled series |
+| `put_quality_report(run_id, report, symbol, source)` | Store quality report |
+| `get_quality_report(report_id)` | Retrieve quality report |
+| `put_artifact(run_id, artifact_type, path, symbol, source)` | Record an artifact |
+| `list_artifacts(run_id, artifact_type)` | List stored artifacts |
+| `put_run_metadata(run_id, start_date, end_date)` | Register/update a run |
+| `get_run_ids()` | List all known run IDs |
+| `get_instruments()` | List all known instruments |
+| `get_sources()` | List all known data source names |
+| `list_runs_with_stats()` | Cross-run summary statistics |
+
+#### Migration System
+
+Schema changes are applied in order via the `_MIGRATIONS` class attribute. Each migration is a `(version_name, sql)` tuple. The `migrations` table tracks which versions have been applied, so new databases bootstrap with all migrations while existing databases upgrade incrementally.
+
 ### Persistent Reasoning Trace
 
 The workflow now persists LLM reasoning and runtime activity in two forms:

@@ -1,6 +1,7 @@
 """Deterministic domain tools exposed to ReAct agents via langchain annotations."""
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import re
@@ -15,11 +16,182 @@ import pandas as pd
 import seaborn as sns
 from langchain_core.tools import StructuredTool
 
+from financial_time_series_construction.database import (
+    DataStore,
+    get_datastore,
+    init_datastore,
+    reset_datastore,
+)
+
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUTPUT_ROOT = Path(os.getenv("TIME_SERIES_OUTPUT_DIR", Path.home() / "time_series_construction"))
 SOURCES = ("yahoo", "bloomberg", "reuters")
 logger = logging.getLogger(__name__)
+
+# ── DataStore integration ────────────────────────────────────────────────
+# The processor injects the run_id via set_run_id() before invoking any tool.
+# This allows tools to store/load time series data without the LLM needing to
+# pass run_id, and without serializing full payloads into LLM conversation.
+# The DataStore is a global singleton created under the
+# ``time_series_database/database/`` subfolder of the output root.
+_current_run_id: str | None = None
+
+
+def set_run_id(run_id: str) -> None:
+    """Set the current run_id for DataStore operations.
+
+    Called by the processor before invoking tools so that time series data
+    can be stored/loaded from the correct database.
+
+    Args:
+        run_id: The run/session identifier.
+    """
+    global _current_run_id
+    _current_run_id = run_id
+    # Ensure DataStore is initialised with the correct output root.
+    # Idempotent: subsequent calls with the same OUTPUT_ROOT are no-ops.
+    try:
+        get_datastore()
+    except RuntimeError:
+        init_datastore(OUTPUT_ROOT / "time_series_database" / "database" / "datastore.db")
+
+
+def _get_data_store() -> DataStore:
+    """Return the global DataStore singleton.
+
+    Returns:
+        The global DataStore instance (created under ``time_series_database/database/``).
+
+    Raises:
+        RuntimeError: If ``set_run_id()`` has not been called.
+    """
+    if _current_run_id is None:
+        raise RuntimeError(
+            "run_id not set. Call set_run_id() before using tools "
+            "that require DataStore."
+        )
+    try:
+        return get_datastore()
+    except RuntimeError:
+        init_datastore(OUTPUT_ROOT / "time_series_database" / "database" / "datastore.db")
+        return get_datastore()
+
+
+def _resolve_timeseries(
+    prices: dict[str, Any] | None = None,
+    data_ref: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
+    method: str | None = None,
+    prefer_filled: bool = True,
+) -> dict[str, Any]:
+    """Resolve a time series from explicit prices, data_ref, or identifiers.
+
+    Priority:
+    1. ``prices`` dict (backward compatibility) – used as-is.
+    2. ``data_ref`` – loaded from the DataStore (supports both raw and
+       gap-filled references).
+    3. ``symbol`` + ``source`` – looked up in the DataStore for the current
+       run. When *prefer_filled* is True, gap-filled series are tried first,
+       then the raw series.
+
+    The time series data is always loaded from the database – never from the
+    LLM-provided conversation.
+
+    Args:
+        prices: Backward-compat inline payload with 'dates'/'prices'.
+        data_ref: Reference key from the DataStore.
+        symbol: Ticker symbol.
+        source: Data source name.
+        method: Gap-filling method (used for filled lookups).
+        prefer_filled: When True (and symbol+source are used), try
+            gap-filled series first, then raw.
+
+    Returns:
+        A dict with ``symbol``, ``source``, ``dates``, ``prices`` plus any
+        method/filled metadata when a filled series is loaded.
+
+    Raises:
+        ValueError: If no series can be resolved.
+    """
+    if prices is not None and isinstance(prices, dict):
+        return prices
+
+    store = None
+    try:
+        store = _get_data_store()
+    except RuntimeError:
+        pass
+
+    if data_ref is not None and store is not None:
+        try:
+            if str(data_ref).endswith(":filled"):
+                return store.get_gap_filled_series(data_ref)
+            return store.get_timeseries(data_ref)
+        except KeyError:
+            pass
+
+    if store is not None and symbol and source:
+        run_id = _current_run_id or ""
+        if run_id:
+            if prefer_filled:
+                try:
+                    filled_list = store.list_gap_filled_series(
+                        run_id, symbol=symbol, source=source
+                    )
+                    if filled_list:
+                        item = filled_list[0]
+                        item_ref = item.get("data_ref")
+                        if item_ref:
+                            loaded = store.get_gap_filled_series(item_ref)
+                            if loaded and loaded.get("filled_dates") and loaded.get("filled_prices"):
+                                logger.info(
+                                    "series_resolved_from_store mode=filled symbol=%s source=%s method=%s",
+                                    symbol, source, loaded.get("method"),
+                                )
+                                return loaded
+                except KeyError:
+                    pass
+            try:
+                raw_list = store.list_timeseries(run_id, symbol=symbol, source=source)
+                if raw_list:
+                    item = raw_list[0]
+                    item_ref = item.get("data_ref")
+                    if item_ref:
+                        loaded = store.get_timeseries(item_ref)
+                        logger.info(
+                            "series_resolved_from_store mode=raw symbol=%s source=%s observations=%d",
+                            symbol, source, len(loaded.get("dates", [])),
+                        )
+                        return loaded
+            except KeyError:
+                pass
+
+    raise ValueError(
+        "Could not resolve time series data from the database. Provide "
+        "'prices', 'data_ref', or 'symbol' + 'source'."
+    )
+
+
+def _build_summary(series: pd.Series) -> dict[str, Any]:
+    """Build a compact summary dict from a pandas Series.
+
+    Args:
+        series: A pandas Series of price values indexed by date.
+
+    Returns:
+        A dict with count, start_date, end_date, available, missing, min, max.
+    """
+    return {
+        "count": len(series),
+        "start_date": series.index.min().strftime("%Y-%m-%d") if len(series) else None,
+        "end_date": series.index.max().strftime("%Y-%m-%d") if len(series) else None,
+        "available": int(series.notna().sum()),
+        "missing": int(series.isna().sum()),
+        "min": float(series.min(skipna=True)) if series.notna().any() else None,
+        "max": float(series.max(skipna=True)) if series.notna().any() else None,
+    }
 
 
 def _debug_flow_enabled() -> bool:
@@ -451,11 +623,28 @@ def historical_prices(symbol: str, start_date: str, end_date: str, source: str) 
         symbol, source, len(series), int(series.isna().sum()),
     )
     _debug_tool_event("historical_prices", "completed", symbol=symbol, source=source, observations=len(series))
+
+    # Store the full time series in the DataStore so downstream tools can
+    # load it via data_ref without the LLM needing to see the full payload.
+    dates_list = [d.strftime("%Y-%m-%d") for d in series.index]
+    prices_list = [None if pd.isna(value) else float(value) for value in series]
+    data_ref = _get_data_store().put_timeseries(
+        run_id=_current_run_id or "",
+        symbol=symbol,
+        source=source,
+        dates=dates_list,
+        prices=prices_list,
+    )
     return {
         "symbol": symbol,
         "source": source,
-        "dates": [d.strftime("%Y-%m-%d") for d in series.index],
-        "prices": [None if pd.isna(value) else float(value) for value in series],
+        "data_ref": data_ref,
+        "summary": _build_summary(series),
+        # Keep dates/prices for backward compatibility with tools that
+        # receive inline data. The processor strips these before sending
+        # to the LLM to avoid token bloat.
+        "dates": dates_list,
+        "prices": prices_list,
     }
 
 
@@ -465,6 +654,7 @@ def check_data_quality(
     source: str | None = None,
     symbol: str | None = None,
     data: dict[str, Any] | None = None,
+    data_ref: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
@@ -474,6 +664,7 @@ def check_data_quality(
     single data dict from historical_prices output (with 'prices', 'source',
     'symbol' keys). If only source and symbol are provided (without prices),
     the tool will automatically fetch historical data using historical_prices.
+    Alternatively, pass a data_ref to load data from the DataStore.
 
     Args:
         prices: List of price values (may contain None for missing).
@@ -481,12 +672,24 @@ def check_data_quality(
         symbol: Ticker symbol.
         data: Optional dict from historical_prices output containing
               'prices', 'source', and 'symbol' keys.
+        data_ref: Optional reference key to load data from the DataStore.
         start_date: Start date for auto-fetching data (YYYY-MM-DD).
         end_date: End date for auto-fetching data (YYYY-MM-DD).
 
     Returns:
         Dict with quality metrics including missing_count, completeness_pct, issues.
     """
+    # Load from DataStore if data_ref is provided
+    if data_ref is not None and data is None:
+        try:
+            data = _get_data_store().get_timeseries(data_ref)
+            logger.info(
+                "tool_check_data_quality_loaded_from_store data_ref=%s symbol=%s source=%s",
+                data_ref, data.get("symbol"), data.get("source"),
+            )
+        except KeyError as error:
+            raise ValueError(f"Could not load data from DataStore: {error}")
+
     # Support passing the full historical_prices result dict as a single argument
     if data is not None:
         prices = data.get("prices", prices)
@@ -513,6 +716,7 @@ def check_data_quality(
             raise ValueError(
                 f"Could not auto-fetch data for {symbol} from {source}: {error}"
             )
+
 
     if prices is None or source is None or symbol is None:
         raise ValueError(
@@ -597,20 +801,50 @@ def recommend_gap_methods(quality_report: dict[str, Any], prices: dict[str, Any]
 
 
 def apply_gap_filling(
-    prices: dict[str, Any],
-    method: str,
+    prices: dict[str, Any] | None = None,
+    method: str = "linear_interpolation",
     dates: list[str] | None = None,
+    data_ref: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
     """Apply a supported gap-filling method to price data.
 
+    The time series is always loaded from the database – never from the
+    LLM.  Accepts either a ``prices`` dict (backward compatibility), a
+    ``data_ref``, or ``symbol`` + ``source`` identifiers to look up the
+    series in the DataStore for the current run.
+
     Args:
-        prices: Output from historical_prices with 'prices' and 'dates' keys.
+        prices: Backward-compat output from historical_prices with 'prices' and 'dates' keys.
         method: One of 'linear_interpolation', 'forward_fill', 'backward_fill', 'none'.
         dates: Optional override for date index.
+        data_ref: Reference key to load prices from the DataStore.
+        symbol: Ticker symbol (used with ``source`` to look up the series
+            from the database).
+        source: Data source name (used with ``symbol``).
 
     Returns:
-        Dict with filled prices, dates, and method metadata.
+        Dict with filled prices, dates, method metadata, and a ``data_ref``
+        if the result was stored in the DataStore.
     """
+    # Resolve the input series from the database. The LLM only needs to pass
+    # identifiers (data_ref or symbol+source) – never the full time series.
+    prices = _resolve_timeseries(
+        prices=prices,
+        data_ref=data_ref,
+        symbol=symbol,
+        source=source,
+        method=method,
+        prefer_filled=False,
+    )
+    if "dates" not in prices or "prices" not in prices:
+        raise ValueError(
+            "apply_gap_filling requires a series with 'dates' and 'prices'. "
+            "Provide 'data_ref' or 'symbol' + 'source' so data can be loaded "
+            "from the database."
+        )
+
     logger.info("tool_gap_filling_start symbol=%s method=%s", prices.get("symbol"), method)
     _debug_tool_event("apply_gap_filling", "start", symbol=prices.get("symbol"), method=method)
     source_dates = [str(value) for value in (dates or prices["dates"])]
@@ -631,17 +865,45 @@ def apply_gap_filling(
         filled = series
     else:
         raise ValueError(f"Unsupported gap method: {method}")
+
+    filled_dates = [d.strftime("%Y-%m-%d") for d in filled.index]
+    filled_prices = [None if pd.isna(value) else float(value) for value in filled]
+
     result = {
         "symbol": prices["symbol"],
         "source": prices.get("source"),
         "method": method,
         "original_dates": source_dates,
         "original_prices": original_prices,
-        "filled_dates": [d.strftime("%Y-%m-%d") for d in filled.index],
-        "filled_prices": [None if pd.isna(value) else float(value) for value in filled],
-        "dates": [d.strftime("%Y-%m-%d") for d in filled.index],
-        "prices": [None if pd.isna(value) else float(value) for value in filled],
+        "filled_dates": filled_dates,
+        "filled_prices": filled_prices,
+        "dates": filled_dates,
+        "prices": filled_prices,
     }
+
+    # Store the gap-filled result in the DataStore so downstream tools can
+    # load it via data_ref without the LLM needing to see the full payload.
+    try:
+        store = _get_data_store()
+        filled_data_ref = store.put_gap_filled_series(
+            run_id=_current_run_id or "",
+            symbol=str(prices.get("symbol", "UNKNOWN")),
+            source=str(prices.get("source", "unknown")),
+            method=method,
+            original_dates=source_dates,
+            original_prices=original_prices,
+            filled_dates=filled_dates,
+            filled_prices=filled_prices,
+            original_data_ref=data_ref,
+        )
+        result["data_ref"] = filled_data_ref
+        logger.debug(
+            "gap_filled_series_stored data_ref=%s symbol=%s method=%s",
+            filled_data_ref, prices.get("symbol"), method,
+        )
+    except Exception as error:
+        logger.warning("gap_filled_series_store_failed error=%s", error)
+
     logger.info(
         "tool_gap_filling_completed symbol=%s method=%s observations=%d remaining_missing=%d",
         prices.get("symbol"), method, len(filled), int(filled.isna().sum()),
@@ -651,20 +913,48 @@ def apply_gap_filling(
 
 
 def build_timeseries(
-    series: dict[str, Any],
+    series: dict[str, Any] | None = None,
     filename: str = "final_timeseries.csv",
     run_id: str | None = None,
+    data_ref: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
 ) -> str:
     """Persist a final time series CSV artifact.
 
+    The time series is always loaded from the database – never from the
+    LLM.  Accepts either a ``series`` dict (backward compatibility), a
+    ``data_ref``, or ``symbol`` + ``source`` identifiers to look up the
+    series in the DataStore for the current run.
+
     Args:
-        series: Dict with 'dates' and 'prices' keys.
+        series: Backward-compat dict with 'dates' and 'prices' keys.
         filename: Output filename.
         run_id: Optional run identifier for directory structure.
+        data_ref: Reference key to load series from DataStore.
+        symbol: Ticker symbol (used with ``source``).
+        source: Data source name (used with ``symbol``).
 
     Returns:
         Path to the saved CSV file.
     """
+    # Resolve the input series from the database. The LLM only needs to pass
+    # identifiers (data_ref or symbol+source) – never the full time series.
+    loaded_series = _resolve_timeseries(
+        prices=series,
+        data_ref=data_ref,
+        symbol=symbol,
+        source=source,
+        prefer_filled=True,
+    )
+    if "dates" not in loaded_series and "filled_dates" not in loaded_series:
+        raise ValueError(
+            "build_timeseries requires a series with dates/prices. "
+            "Provide 'data_ref' or 'symbol' + 'source'."
+        )
+    if loaded_series is not series:
+        series = loaded_series
+
     output_dates = series.get("filled_dates") or series.get("dates") or []
     output_prices = series.get("filled_prices") or series.get("prices") or []
     logger.info("tool_build_timeseries_start symbol=%s filename=%s prices_length=%d", series.get("symbol"), filename, len(output_prices))
@@ -679,6 +969,19 @@ def build_timeseries(
     if series.get("method"):
         frame_data["gap_filling_method"] = [series.get("method")] * len(output_dates)
     pd.DataFrame(frame_data).to_csv(output, index=False)
+
+    # Record artifact in DataStore
+    try:
+        _get_data_store().put_artifact(
+            run_id=run_id or _current_run_id or "",
+            artifact_type="csv",
+            path=str(output),
+            symbol=series.get("symbol"),
+            source=series.get("source"),
+        )
+    except Exception as error:
+        logger.warning("artifact_store_failed path=%s error=%s", output, error)
+
     logger.info("tool_build_timeseries_completed path=%s", output)
     _debug_tool_event("build_timeseries", "completed", path=output)
     return str(output)
@@ -707,20 +1010,43 @@ def generate_report(
 
 
 def visualize_timeseries(
-    prices: dict[str, Any],
+    prices: dict[str, Any] | None = None,
     title: str = "Time series",
     run_id: str | None = None,
+    data_ref: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
 ) -> str:
     """Create a seaborn time series chart and save as PNG.
 
+    The time series is always loaded from the database – never from the
+    LLM.  Accepts either a ``prices`` dict (backward compatibility), a
+    ``data_ref``, or ``symbol`` + ``source`` identifiers to look up the
+    series in the DataStore for the current run.
+
     Args:
-        prices: Dict with 'dates' and 'prices' keys.
+        prices: Backward-compat dict with 'dates' and 'prices' keys.
         title: Chart title.
         run_id: Optional run identifier.
+        data_ref: Reference key to load series from the DataStore.
+        symbol: Ticker symbol (used with ``source`` to look up the series).
+        source: Data source name (used with ``symbol``).
 
     Returns:
         Path to the saved PNG file.
     """
+    prices = _resolve_timeseries(
+        prices=prices,
+        data_ref=data_ref,
+        symbol=symbol,
+        source=source,
+        prefer_filled=True,
+    )
+    if "dates" not in prices and "filled_dates" not in prices:
+        raise ValueError(
+            "visualize_timeseries requires a series with dates/prices. "
+            "Provide 'data_ref' or 'symbol' + 'source'."
+        )
     logger.info("tool_visualize_timeseries_start symbol=%s title=%s", prices.get("symbol"), title)
     output = _run_dir(run_id) / "timeseries.png"
     filled_dates = prices.get("filled_dates") or prices.get("dates") or []

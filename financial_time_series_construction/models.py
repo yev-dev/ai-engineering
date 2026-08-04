@@ -61,11 +61,11 @@ def _resolve_model(provider: str, explicit_model: str | None) -> str:
         model = explicit_model.strip()
     else:
         per_provider_default = {
-            "ollama": os.getenv("LLM_OLLAMA_MODEL", "deepseek-v2:16b"),
+            "ollama": os.getenv("LLM_OLLAMA_MODEL", "qwen2.5:1.5b"),
             "github": os.getenv("LLM_GITHUB_MODEL", "gpt-4.1"),
             "deepseek": os.getenv("LLM_DEEPSEEK_MODEL", "deepseek-chat"),
         }
-        model = per_provider_default.get(provider, "deepseek-v2:16b")
+        model = per_provider_default.get(provider, "qwen2.5:1.5b")
 
     if "/" in model:
         return model
@@ -102,7 +102,7 @@ class LLMRequest:
     """Data class representing a request to an LLM."""
     model: str = ""
     temperature: float = 0.1
-    max_tokens: int = 2048
+    max_tokens: int = 512
     system_prompt: str = ""
     messages: list[dict[str, str]] = field(default_factory=list)
     callbacks: list[Any] | None = None
@@ -143,7 +143,7 @@ class ModelRequestFactory:
         self.model = model
         self.provider = provider
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_tokens = min(max_tokens, 512) if max_tokens else 512
         self.provider_kwargs = provider_kwargs or {}
 
     def chat(self, request: LLMRequest) -> str:

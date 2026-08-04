@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 from collections import deque
 from typing import Any
@@ -46,6 +47,9 @@ class TimeSeriesConstructionHandler:
             "payload": payload,
         }
         self.trace_records.append(record)
+        # Mirror structured records into plain-text trace so react_trace.txt
+        # includes every recorded reasoning/decision step.
+        self.react_trace.append(json.dumps(record, default=str))
         logger.debug(
             "trace_record_added session_id=%s type=%s agent=%s",
             self.session_id,
