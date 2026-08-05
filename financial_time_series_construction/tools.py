@@ -11,7 +11,14 @@ from difflib import get_close_matches
 from pathlib import Path
 from typing import Any
 
-import matplotlib.pyplot as plt
+import matplotlib
+
+# Use a non-interactive backend so that figures can be created from worker
+# threads.  The default macOS backend ("macosx") requires the main thread and
+# raises ``RuntimeError: Cannot create a GUI FigureManager outside the main
+# thread`` when tools are invoked from a ReAct agent's thread pool.
+matplotlib.use("agg")
+import matplotlib.pyplot as plt  # noqa: E402  (import after backend selection)
 import pandas as pd
 import seaborn as sns
 from langchain_core.tools import StructuredTool
@@ -1157,6 +1164,661 @@ def request_human_input(
     return result
 
 
+def get_populated_timeseries(
+    run_id: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Load populated time series data for a run from the DataStore.
+
+    Sources data from both the ``raw_timeseries`` (populated before) and
+    ``filled_timeseries`` (populated after) tables.  Returns a comparison
+    view with both the original (pre-fill) series and the gap-filled
+    (post-fill) series.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+        symbol: Optional ticker symbol filter.
+        source: Optional data source name filter.
+
+    Returns:
+        Dict with ``run_id``, ``symbols``, ``sources``, ``before``
+        and ``after`` series lists.  Each series entry contains
+        ``symbol``, ``source``, ``data_ref``, ``dates``, ``prices``
+        (and ``method`` / ``filled_dates`` / ``filled_prices`` for
+        the after table).
+
+    Raises:
+        ValueError: If no populated series are found.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+
+    logger.info(
+        "tool_get_populated_timeseries_start run_id=%s symbol=%s source=%s",
+        run_id, symbol or "*", source or "*",
+    )
+    _debug_tool_event(
+        "get_populated_timeseries", "start",
+        run_id=run_id, symbol=symbol or "*", source=source or "*",
+    )
+
+    before_series = store.list_timeseries(
+        run_id, symbol=symbol, source=source
+    )
+    after_series = store.list_gap_filled_series(
+        run_id, symbol=symbol, source=source
+    )
+
+    # Normalise "before" entries: list_timeseries already returns
+    # data_ref/symbol/source/dates/prices.
+    before: list[dict[str, Any]] = []
+    for item in before_series:
+        loaded = store.get_timeseries(item["data_ref"])
+        before.append({
+            "symbol": loaded.get("symbol"),
+            "source": loaded.get("source"),
+            "data_ref": item["data_ref"],
+            "dates": loaded.get("dates", []),
+            "prices": loaded.get("prices", []),
+        })
+        logger.debug(
+            "populated_before_series symbol=%s source=%s observations=%d",
+            loaded.get("symbol"), loaded.get("source"), len(loaded.get("dates", [])),
+        )
+
+    # Normalise "after" entries: list_gap_filled_series returns
+    # filled_dates/filled_prices but we also want original_dates/prices.
+    after: list[dict[str, Any]] = []
+    for item in after_series:
+        loaded = store.get_gap_filled_series(item["data_ref"])
+        after.append({
+            "symbol": loaded.get("symbol"),
+            "source": loaded.get("source"),
+            "data_ref": item["data_ref"],
+            "method": loaded.get("method"),
+            "original_dates": loaded.get("original_dates", []),
+            "original_prices": loaded.get("original_prices", []),
+            "filled_dates": loaded.get("filled_dates", []),
+            "filled_prices": loaded.get("filled_prices", []),
+        })
+        logger.debug(
+            "populated_after_series symbol=%s source=%s method=%s observations=%d",
+            loaded.get("symbol"), loaded.get("source"), loaded.get("method"),
+            len(loaded.get("filled_dates", [])),
+        )
+
+    if not before and not after:
+        raise ValueError(
+            f"No populated time series found for run_id={run_id!r} "
+            f"symbol={symbol!r} source={source!r}. "
+            "Run a workflow first to populate the DataStore."
+        )
+
+    symbols = sorted({item["symbol"] for item in before + after if item.get("symbol")})
+    sources = sorted({item["source"] for item in before + after if item.get("source")})
+
+    result = {
+        "run_id": run_id,
+        "symbols": symbols,
+        "sources": sources,
+        "before": before,
+        "after": after,
+    }
+    logger.info(
+        "tool_get_populated_timeseries_completed run_id=%s before=%d after=%d",
+        run_id, len(before), len(after),
+    )
+    _debug_tool_event(
+        "get_populated_timeseries", "completed",
+        run_id=run_id, before=len(before), after=len(after),
+    )
+    return result
+
+
+def find_run_by_id(run_id: str) -> dict[str, Any]:
+    """Find a run record in the DataStore by its ``run_id``.
+
+    Args:
+        run_id: The run/session identifier to look up.
+
+    Returns:
+        Dict with ``found`` boolean plus run metadata when resolved:
+        ``run_id``, ``start_date``, ``end_date``, ``created_at``,
+        ``updated_at``, ``timeseries_count``, ``filled_count``,
+        ``artifact_count``.
+
+    Raises:
+        ValueError: If the DataStore is not initialised (``set_run_id()``
+            has not been called).
+    """
+    store = _get_data_store()
+
+    logger.info("tool_find_run_by_id_start run_id=%s", run_id)
+    _debug_tool_event("find_run_by_id", "start", run_id=run_id)
+
+    try:
+        run_record = store.get_run(run_id)
+    except KeyError:
+        logger.warning("tool_find_run_by_id_not_found run_id=%s", run_id)
+        _debug_tool_event("find_run_by_id", "not_found", run_id=run_id)
+        return {"found": False, "run_id": run_id}
+
+    logger.info("tool_find_run_by_id_found run_id=%s", run_id)
+    _debug_tool_event("find_run_by_id", "found", run_id=run_id)
+    return {"found": True, **run_record}
+
+
+# ── DataStore tools ────────────────────────────────────────────────────────
+# These tools expose the DataStore API (database.py) to ReAct agents.  They
+# are registered in DATASTORE_TOOL_REGISTRY and can be used independently of
+# the domain tools in TOOL_REGISTRY.  All tools operate on the global
+# DataStore singleton and require set_run_id() to have been called first.
+
+
+def datastore_put_run_metadata(
+    run_id: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Register or update a run with optional date metadata in the DataStore.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+        start_date: Optional ISO start date.
+        end_date: Optional ISO end date.
+
+    Returns:
+        Dict with ``run_id`` and the numeric ``run_id_num`` of the row.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    run_id_num = store.put_run_metadata(run_id, start_date=start_date, end_date=end_date)
+    logger.info("datastore_put_run_metadata run_id=%s run_id_num=%d", run_id, run_id_num)
+    _debug_tool_event("datastore_put_run_metadata", "completed", run_id=run_id)
+    return {"run_id": run_id, "run_id_num": run_id_num}
+
+
+def datastore_get_run(run_id: str | None = None) -> dict[str, Any]:
+    """Return a single run record from the DataStore by its ``run_id``.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+
+    Returns:
+        Dict with ``found`` boolean plus run metadata when resolved:
+        ``run_id``, ``start_date``, ``end_date``, ``created_at``,
+        ``updated_at``, ``timeseries_count``, ``filled_count``,
+        ``artifact_count``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    try:
+        run_record = store.get_run(run_id)
+    except KeyError:
+        logger.warning("datastore_get_run_not_found run_id=%s", run_id)
+        return {"found": False, "run_id": run_id}
+    logger.info("datastore_get_run_found run_id=%s", run_id)
+    return {"found": True, **run_record}
+
+
+def datastore_list_runs() -> dict[str, Any]:
+    """List all runs in the DataStore with summary statistics.
+
+    Returns:
+        Dict with ``runs`` list.  Each entry contains ``run_id``,
+        ``start_date``, ``end_date``, ``created_at``,
+        ``timeseries_count``, ``filled_count``, ``artifact_count``.
+    """
+    store = _get_data_store()
+    runs = store.list_runs_with_stats()
+    logger.info("datastore_list_runs count=%d", len(runs))
+    _debug_tool_event("datastore_list_runs", "completed", count=len(runs))
+    return {"runs": runs}
+
+
+def datastore_list_instruments() -> dict[str, Any]:
+    """List all known instrument symbols in the DataStore.
+
+    Returns:
+        Dict with ``instruments`` list of symbol strings.
+    """
+    store = _get_data_store()
+    instruments = store.get_instruments()
+    logger.info("datastore_list_instruments count=%d", len(instruments))
+    _debug_tool_event("datastore_list_instruments", "completed", count=len(instruments))
+    return {"instruments": instruments}
+
+
+def datastore_list_sources() -> dict[str, Any]:
+    """List all known data source names in the DataStore.
+
+    Returns:
+        Dict with ``sources`` list of source name strings.
+    """
+    store = _get_data_store()
+    sources = store.get_sources()
+    logger.info("datastore_list_sources count=%d", len(sources))
+    _debug_tool_event("datastore_list_sources", "completed", count=len(sources))
+    return {"sources": sources}
+
+
+def datastore_list_gap_filling_methods() -> dict[str, Any]:
+    """List all known gap-filling method names in the DataStore.
+
+    Returns:
+        Dict with ``methods`` list of method name strings.
+    """
+    store = _get_data_store()
+    methods = store.get_gap_filling_methods()
+    logger.info("datastore_list_gap_filling_methods count=%d", len(methods))
+    _debug_tool_event("datastore_list_gap_filling_methods", "completed", count=len(methods))
+    return {"methods": methods}
+
+
+def datastore_put_timeseries(
+    symbol: str,
+    source: str,
+    dates: list[str],
+    prices: list[Any],
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Store a raw time series in the DataStore and return a reference key.
+
+    Args:
+        symbol: Ticker symbol.
+        source: Data source name.
+        dates: List of ISO date strings.
+        prices: List of price values (float or None for missing).
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+
+    Returns:
+        Dict with ``data_ref``, ``symbol``, ``source``, ``observations``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    if len(dates) != len(prices):
+        raise ValueError("dates and prices must have the same length.")
+    data_ref = store.put_timeseries(
+        run_id=run_id,
+        symbol=symbol,
+        source=source,
+        dates=dates,
+        prices=prices,
+    )
+    logger.info(
+        "datastore_put_timeseries data_ref=%s symbol=%s source=%s observations=%d",
+        data_ref, symbol, source, len(dates),
+    )
+    _debug_tool_event("datastore_put_timeseries", "completed", data_ref=data_ref, observations=len(dates))
+    return {"data_ref": data_ref, "symbol": symbol, "source": source, "observations": len(dates)}
+
+
+def datastore_get_timeseries(data_ref: str) -> dict[str, Any]:
+    """Load a raw time series from the DataStore by its reference key.
+
+    Args:
+        data_ref: The reference key returned by ``datastore_put_timeseries``
+            (form ``<run_id>:<symbol>:<source>``).
+
+    Returns:
+        Dict with ``found`` boolean plus ``run_id``, ``symbol``, ``source``,
+        ``dates``, ``prices`` when resolved.
+    """
+    store = _get_data_store()
+    try:
+        series = store.get_timeseries(data_ref)
+    except KeyError:
+        logger.warning("datastore_get_timeseries_not_found data_ref=%s", data_ref)
+        return {"found": False, "data_ref": data_ref}
+    logger.info(
+        "datastore_get_timeseries_found data_ref=%s symbol=%s observations=%d",
+        data_ref, series.get("symbol"), len(series.get("dates", [])),
+    )
+    return {"found": True, **series}
+
+
+def datastore_list_timeseries(
+    run_id: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """List stored raw time series in the DataStore, optionally filtered.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+        symbol: If provided, filter by symbol.
+        source: If provided, filter by source.
+
+    Returns:
+        Dict with ``series`` list.  Each entry contains ``data_ref``,
+        ``symbol``, ``source``, ``dates``, ``prices``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    series = store.list_timeseries(run_id, symbol=symbol, source=source)
+    logger.info(
+        "datastore_list_timeseries run_id=%s symbol=%s source=%s count=%d",
+        run_id, symbol or "*", source or "*", len(series),
+    )
+    _debug_tool_event("datastore_list_timeseries", "completed", count=len(series))
+    return {"run_id": run_id, "series": series}
+
+
+def datastore_delete_timeseries(data_ref: str) -> dict[str, Any]:
+    """Delete a raw time series from the DataStore by its reference key.
+
+    Args:
+        data_ref: The reference key to delete.
+
+    Returns:
+        Dict with ``deleted`` boolean and ``data_ref``.
+    """
+    store = _get_data_store()
+    deleted = store.delete_timeseries(data_ref)
+    logger.info("datastore_delete_timeseries data_ref=%s deleted=%s", data_ref, deleted)
+    _debug_tool_event("datastore_delete_timeseries", "completed", data_ref=data_ref, deleted=deleted)
+    return {"deleted": deleted, "data_ref": data_ref}
+
+
+def datastore_put_gap_filled_series(
+    symbol: str,
+    source: str,
+    method: str,
+    filled_dates: list[str],
+    filled_prices: list[Any],
+    original_dates: list[str] | None = None,
+    original_prices: list[Any] | None = None,
+    original_data_ref: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Store a gap-filled time series in the DataStore and return a reference key.
+
+    Args:
+        symbol: Ticker symbol.
+        source: Data source name.
+        method: Gap-filling method used (e.g. ``linear_interpolation``).
+        filled_dates: Date strings after filling.
+        filled_prices: Price values after filling.
+        original_dates: Optional original (pre-filling) date strings.
+        original_prices: Optional original (pre-filling) price values.
+        original_data_ref: Optional reference to the raw source series.
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+
+    Returns:
+        Dict with ``data_ref``, ``symbol``, ``source``, ``method``,
+        ``observations``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    if len(filled_dates) != len(filled_prices):
+        raise ValueError("filled_dates and filled_prices must have the same length.")
+    data_ref = store.put_gap_filled_series(
+        run_id=run_id,
+        symbol=symbol,
+        source=source,
+        method=method,
+        filled_dates=filled_dates,
+        filled_prices=filled_prices,
+        original_dates=original_dates,
+        original_prices=original_prices,
+        original_data_ref=original_data_ref,
+    )
+    logger.info(
+        "datastore_put_gap_filled_series data_ref=%s symbol=%s source=%s method=%s observations=%d",
+        data_ref, symbol, source, method, len(filled_dates),
+    )
+    _debug_tool_event("datastore_put_gap_filled_series", "completed", data_ref=data_ref, method=method)
+    return {
+        "data_ref": data_ref,
+        "symbol": symbol,
+        "source": source,
+        "method": method,
+        "observations": len(filled_dates),
+    }
+
+
+def datastore_get_gap_filled_series(data_ref: str) -> dict[str, Any]:
+    """Load a gap-filled series from the DataStore by its reference key.
+
+    Args:
+        data_ref: The reference key returned by
+            ``datastore_put_gap_filled_series``
+            (form ``<run_id>:<symbol>:<source>:filled``).
+
+    Returns:
+        Dict with ``found`` boolean plus ``run_id``, ``symbol``, ``source``,
+        ``method``, ``original_dates``, ``original_prices``,
+        ``filled_dates``, ``filled_prices`` when resolved.
+    """
+    store = _get_data_store()
+    try:
+        series = store.get_gap_filled_series(data_ref)
+    except KeyError:
+        logger.warning("datastore_get_gap_filled_series_not_found data_ref=%s", data_ref)
+        return {"found": False, "data_ref": data_ref}
+    logger.info(
+        "datastore_get_gap_filled_series_found data_ref=%s symbol=%s method=%s",
+        data_ref, series.get("symbol"), series.get("method"),
+    )
+    return {"found": True, **series}
+
+
+def datastore_list_gap_filled_series(
+    run_id: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """List stored gap-filled series in the DataStore, optionally filtered.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+        symbol: If provided, filter by symbol.
+        source: If provided, filter by source.
+
+    Returns:
+        Dict with ``series`` list.  Each entry contains ``data_ref``,
+        ``symbol``, ``source``, ``method``, ``filled_dates``,
+        ``filled_prices``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    series = store.list_gap_filled_series(run_id, symbol=symbol, source=source)
+    logger.info(
+        "datastore_list_gap_filled_series run_id=%s symbol=%s source=%s count=%d",
+        run_id, symbol or "*", source or "*", len(series),
+    )
+    _debug_tool_event("datastore_list_gap_filled_series", "completed", count=len(series))
+    return {"run_id": run_id, "series": series}
+
+
+def datastore_put_quality_report(
+    report: dict[str, Any],
+    symbol: str | None = None,
+    source: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Store a quality report in the DataStore and return a reference key.
+
+    Args:
+        report: The quality report dict.
+        symbol: Optional symbol associated with the report.
+        source: Optional source associated with the report.
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+
+    Returns:
+        Dict with ``report_id``, ``symbol``, ``source``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    report_id = store.put_quality_report(
+        run_id=run_id,
+        report=report,
+        symbol=symbol,
+        source=source,
+    )
+    logger.info(
+        "datastore_put_quality_report report_id=%s symbol=%s source=%s",
+        report_id, symbol or "unknown", source or "unknown",
+    )
+    _debug_tool_event("datastore_put_quality_report", "completed", report_id=report_id)
+    return {"report_id": report_id, "symbol": symbol, "source": source}
+
+
+def datastore_get_quality_report(report_id: str) -> dict[str, Any]:
+    """Load a quality report from the DataStore by its reference key.
+
+    Args:
+        report_id: The reference key returned by
+            ``datastore_put_quality_report``.
+
+    Returns:
+        Dict with ``found`` boolean plus the report dict when resolved.
+    """
+    store = _get_data_store()
+    try:
+        report = store.get_quality_report(report_id)
+    except KeyError:
+        logger.warning("datastore_get_quality_report_not_found report_id=%s", report_id)
+        return {"found": False, "report_id": report_id}
+    logger.info("datastore_get_quality_report_found report_id=%s", report_id)
+    return {"found": True, "report_id": report_id, "report": report}
+
+
+def datastore_list_quality_reports(
+    run_id: str | None = None,
+    symbol: str | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """List quality reports in the DataStore for a run, optionally filtered.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+        symbol: If provided, filter by symbol.
+        source: If provided, filter by source.
+
+    Returns:
+        Dict with ``reports`` list.  Each entry contains ``report_id``,
+        ``symbol``, ``source``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    reports = store.list_quality_reports(run_id, symbol=symbol, source=source)
+    logger.info(
+        "datastore_list_quality_reports run_id=%s symbol=%s source=%s count=%d",
+        run_id, symbol or "*", source or "*", len(reports),
+    )
+    _debug_tool_event("datastore_list_quality_reports", "completed", count=len(reports))
+    return {"run_id": run_id, "reports": reports}
+
+
+def datastore_put_artifact(
+    artifact_type: str,
+    path: str,
+    symbol: str | None = None,
+    source: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Record an artifact path in the DataStore.
+
+    Args:
+        artifact_type: One of 'csv', 'png', 'report'.
+        path: File path to the artifact.
+        symbol: Optional symbol.
+        source: Optional source.
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+
+    Returns:
+        Dict with ``artifact_id``, ``artifact_type``, ``path``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    artifact_id = store.put_artifact(
+        run_id=run_id,
+        artifact_type=artifact_type,
+        path=path,
+        symbol=symbol,
+        source=source,
+    )
+    logger.info(
+        "datastore_put_artifact artifact_id=%s type=%s path=%s",
+        artifact_id, artifact_type, path,
+    )
+    _debug_tool_event("datastore_put_artifact", "completed", artifact_id=artifact_id, type=artifact_type)
+    return {"artifact_id": artifact_id, "artifact_type": artifact_type, "path": path}
+
+
+def datastore_list_artifacts(
+    run_id: str | None = None,
+    artifact_type: str | None = None,
+) -> dict[str, Any]:
+    """List stored artifacts in the DataStore for a run.
+
+    Args:
+        run_id: The run/session identifier.  Defaults to the current run
+            set by ``set_run_id()``.
+        artifact_type: If provided, filter by type.
+
+    Returns:
+        Dict with ``artifacts`` list.  Each entry contains ``artifact_id``,
+        ``artifact_type``, ``path``, ``symbol``, ``source``.
+    """
+    store = _get_data_store()
+    run_id = run_id or _current_run_id
+    if not run_id:
+        raise ValueError("No run_id available; pass run_id or call set_run_id().")
+    artifacts = store.list_artifacts(run_id, artifact_type=artifact_type)
+    logger.info(
+        "datastore_list_artifacts run_id=%s type=%s count=%d",
+        run_id, artifact_type or "*", len(artifacts),
+    )
+    _debug_tool_event("datastore_list_artifacts", "completed", count=len(artifacts))
+    return {"run_id": run_id, "artifacts": artifacts}
+
+
+def datastore_vacuum() -> dict[str, Any]:
+    """Recover disk space and defragment the DataStore database.
+
+    Returns:
+        Dict with ``vacuumed`` boolean and ``db_path``.
+    """
+    store = _get_data_store()
+    store.vacuum()
+    logger.info("datastore_vacuum db_path=%s", store.db_path)
+    _debug_tool_event("datastore_vacuum", "completed")
+    return {"vacuumed": True, "db_path": str(store.db_path)}
+
+
 def _tool(function: Any, name: str, description: str) -> StructuredTool:
     """Wrap a function as a langchain StructuredTool."""
     return StructuredTool.from_function(func=function, name=name, description=description)
@@ -1228,7 +1890,134 @@ TOOL_REGISTRY: dict[str, StructuredTool] = {
         "request_human_input",
         "Request input from the human user with optional choices.",
     ),
+    "get_populated_timeseries": _tool(
+        get_populated_timeseries,
+        "get_populated_timeseries",
+        "Load populated time series data for a run from the DataStore, "
+        "including both the raw (before) and gap-filled (after) series.",
+    ),
+    "find_run_by_id": _tool(
+        find_run_by_id,
+        "find_run_by_id",
+        "Find a run record in the DataStore by its run_id.",
+    ),
 }
+
+
+# ── DataStore tool registry ────────────────────────────────────────────────
+# Exposes the DataStore API (database.py) to ReAct agents.  These tools are
+# kept separate from TOOL_REGISTRY so that agents can opt in to direct
+# database access without exposing the full domain tool surface.
+DATASTORE_TOOL_REGISTRY: dict[str, StructuredTool] = {
+    "datastore_put_run_metadata": _tool(
+        datastore_put_run_metadata,
+        "datastore_put_run_metadata",
+        "Register or update a run with optional date metadata in the DataStore.",
+    ),
+    "datastore_get_run": _tool(
+        datastore_get_run,
+        "datastore_get_run",
+        "Return a single run record from the DataStore by its run_id.",
+    ),
+    "datastore_list_runs": _tool(
+        datastore_list_runs,
+        "datastore_list_runs",
+        "List all runs in the DataStore with summary statistics.",
+    ),
+    "datastore_list_instruments": _tool(
+        datastore_list_instruments,
+        "datastore_list_instruments",
+        "List all known instrument symbols in the DataStore.",
+    ),
+    "datastore_list_sources": _tool(
+        datastore_list_sources,
+        "datastore_list_sources",
+        "List all known data source names in the DataStore.",
+    ),
+    "datastore_list_gap_filling_methods": _tool(
+        datastore_list_gap_filling_methods,
+        "datastore_list_gap_filling_methods",
+        "List all known gap-filling method names in the DataStore.",
+    ),
+    "datastore_put_timeseries": _tool(
+        datastore_put_timeseries,
+        "datastore_put_timeseries",
+        "Store a raw time series in the DataStore and return a reference key.",
+    ),
+    "datastore_get_timeseries": _tool(
+        datastore_get_timeseries,
+        "datastore_get_timeseries",
+        "Load a raw time series from the DataStore by its reference key.",
+    ),
+    "datastore_list_timeseries": _tool(
+        datastore_list_timeseries,
+        "datastore_list_timeseries",
+        "List stored raw time series in the DataStore, optionally filtered by symbol/source.",
+    ),
+    "datastore_delete_timeseries": _tool(
+        datastore_delete_timeseries,
+        "datastore_delete_timeseries",
+        "Delete a raw time series from the DataStore by its reference key.",
+    ),
+    "datastore_put_gap_filled_series": _tool(
+        datastore_put_gap_filled_series,
+        "datastore_put_gap_filled_series",
+        "Store a gap-filled time series in the DataStore and return a reference key.",
+    ),
+    "datastore_get_gap_filled_series": _tool(
+        datastore_get_gap_filled_series,
+        "datastore_get_gap_filled_series",
+        "Load a gap-filled series from the DataStore by its reference key.",
+    ),
+    "datastore_list_gap_filled_series": _tool(
+        datastore_list_gap_filled_series,
+        "datastore_list_gap_filled_series",
+        "List stored gap-filled series in the DataStore, optionally filtered by symbol/source.",
+    ),
+    "datastore_put_quality_report": _tool(
+        datastore_put_quality_report,
+        "datastore_put_quality_report",
+        "Store a quality report in the DataStore and return a reference key.",
+    ),
+    "datastore_get_quality_report": _tool(
+        datastore_get_quality_report,
+        "datastore_get_quality_report",
+        "Load a quality report from the DataStore by its reference key.",
+    ),
+    "datastore_list_quality_reports": _tool(
+        datastore_list_quality_reports,
+        "datastore_list_quality_reports",
+        "List quality reports in the DataStore for a run, optionally filtered by symbol/source.",
+    ),
+    "datastore_put_artifact": _tool(
+        datastore_put_artifact,
+        "datastore_put_artifact",
+        "Record an artifact path in the DataStore.",
+    ),
+    "datastore_list_artifacts": _tool(
+        datastore_list_artifacts,
+        "datastore_list_artifacts",
+        "List stored artifacts in the DataStore for a run, optionally filtered by type.",
+    ),
+    "datastore_vacuum": _tool(
+        datastore_vacuum,
+        "datastore_vacuum",
+        "Recover disk space and defragment the DataStore database.",
+    ),
+}
+
+
+def get_datastore_tool(name: str) -> StructuredTool | None:
+    """Retrieve a DataStore tool by name from the registry."""
+    return DATASTORE_TOOL_REGISTRY.get(name)
+
+
+def get_datastore_tool_description(name: str) -> str | None:
+    """Return a DataStore tool description from the registry if available."""
+    tool = DATASTORE_TOOL_REGISTRY.get(name)
+    if tool is None:
+        return None
+    return str(getattr(tool, "description", "") or "").strip() or None
 
 
 def get_tool(name: str) -> StructuredTool | None:

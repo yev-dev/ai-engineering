@@ -101,6 +101,19 @@
             }
         },
         {
+            "name": "Financial Time Series Construction: Dashboard",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "financial_time_series_construction.dashboard_app",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "LOG_LEVEL": "INFO",
+                "STREAMLIT_PORT": "8501"
+            }
+        },
+        {
             "name": "Financial Time Series Construction: pytest workflow",
             "type": "debugpy",
             "request": "launch",

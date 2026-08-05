@@ -39,6 +39,13 @@ def _load_default_env_files() -> None:
         load_dotenv(local_override_file, override=False)
 
 
+# Load default env files at module import time so that environment-driven
+# defaults (e.g. ``LLM_TIMEOUT``) are available when module-level constants
+# are evaluated.  ``load_dotenv(override=False)`` only sets vars that are not
+# already present in the process environment, so explicit exports always win.
+_load_default_env_files()
+
+
 def _normalize_provider(provider: str | None) -> str:
     """Normalize provider value to a supported key."""
     value = (provider or "").strip().casefold() or "ollama"
@@ -97,12 +104,19 @@ def _provider_kwargs(provider: str) -> dict[str, Any]:
     return kwargs
 
 
+# Default request timeout in seconds.  Local models (e.g. Ollama running a
+# 16B parameter model) can take significantly longer than cloud APIs, so the
+# default is generous and overridable via the ``LLM_TIMEOUT`` env var.
+_DEFAULT_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "300"))
+
+
 @dataclass
 class LLMRequest:
     """Data class representing a request to an LLM."""
     model: str = ""
     temperature: float = 0.1
     max_tokens: int = 512
+    timeout: float = _DEFAULT_TIMEOUT
     system_prompt: str = ""
     messages: list[dict[str, str]] = field(default_factory=list)
     callbacks: list[Any] | None = None
@@ -121,6 +135,7 @@ class LLMRequest:
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
         }
         if self.callbacks:
             result["callbacks"] = self.callbacks
@@ -167,6 +182,7 @@ class ModelRequestFactory:
             model=effective_model,
             temperature=effective_temperature,
             max_tokens=effective_max_tokens,
+            timeout=request.timeout,
             system_prompt=request.system_prompt,
             messages=request.messages,
             callbacks=request.callbacks,
@@ -210,6 +226,7 @@ class ModelRequestFactory:
             "model": model,
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.1")),
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048")),
+            "timeout": _DEFAULT_TIMEOUT,
             "provider_kwargs": _provider_kwargs(provider),
             "supported_providers": list(SUPPORTED_PROVIDERS),
         }

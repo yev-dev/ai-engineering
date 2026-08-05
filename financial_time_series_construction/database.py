@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -211,6 +212,7 @@ class DataStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection | None = None
+        self._lock = threading.RLock()
         self._init_schema()
         logger.info("DataStore initialised at %s", self.db_path)
         logger.debug("datastore_initialized path=%s", self.db_path)
@@ -219,18 +221,28 @@ class DataStore:
 
     @property
     def connection(self) -> sqlite3.Connection:
-        """Return a persistent connection (created lazily)."""
+        """Return a persistent connection (created lazily).
+
+        The connection is created with ``check_same_thread=False`` so it can
+        be shared across threads (e.g. the dashboard's background worker
+        thread and the main Streamlit thread).  All public methods acquire
+        ``self._lock`` to serialise access and prevent concurrent writes.
+        """
         if self._connection is None:
-            self._connection = sqlite3.connect(str(self.db_path))
+            self._connection = sqlite3.connect(
+                str(self.db_path),
+                check_same_thread=False,
+            )
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA foreign_keys=ON")
         return self._connection
 
     def close(self) -> None:
         """Close the persistent database connection."""
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = None
+        with self._lock:
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
 
     def __del__(self) -> None:
         self.close()
@@ -568,6 +580,52 @@ class DataStore:
             )
             conn.commit()
         return run_id_num
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        """Return a single run record by its ``run_id``.
+
+        Args:
+            run_id: The run/session identifier.
+
+        Returns:
+            Dict with ``run_id``, ``start_date``, ``end_date``,
+            ``created_at``, ``updated_at`` plus summary stats
+            (``timeseries_count``, ``filled_count``, ``artifact_count``).
+
+        Raises:
+            KeyError: If no run with the given ``run_id`` exists.
+        """
+        conn = self.connection
+        row = conn.execute(
+            """
+            SELECT r.run_id, r.start_date, r.end_date,
+                   r.created_at, r.updated_at,
+                   (SELECT COUNT(*) FROM raw_timeseries rt
+                    WHERE rt.run_id = r.id) AS ts_count,
+                   (SELECT COUNT(*) FROM filled_timeseries ft
+                    WHERE ft.run_id = r.id) AS filled_count,
+                   (SELECT COUNT(*) FROM artifacts a
+                    WHERE a.run_id = r.id) AS art_count
+            FROM runs r
+            WHERE r.run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+
+        if row is None:
+            raise KeyError(f"No run found for run_id: {run_id}")
+
+        logger.debug("run_retrieved run_id=%s", run_id)
+        return {
+            "run_id": row[0],
+            "start_date": row[1],
+            "end_date": row[2],
+            "created_at": row[3],
+            "updated_at": row[4],
+            "timeseries_count": row[5],
+            "filled_count": row[6],
+            "artifact_count": row[7],
+        }
 
     def get_run_ids(self) -> list[str]:
         """Return all known run IDs ordered by creation time."""

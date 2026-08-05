@@ -2808,10 +2808,22 @@ class TimeSeriesConstructionProcessor:
             f"gapfilling_to_construction symbol={filled_data.get('symbol')} method={filled_data.get('method')}",
         )
 
+        gap_filling_report = {
+            "symbol": filled_data.get("symbol"),
+            "source": filled_data.get("source"),
+            "method": filled_data.get("method"),
+            "data_ref": filled_data.get("data_ref"),
+        }
         continuation_events = [
             CallbackEvent(
                 CallbackEventType.AGENT_COMPLETED,
-                {"agent": agent.name, "result": {"delegated_to": construction_agent.name}},
+                {
+                    "agent": agent.name,
+                    "result": {
+                        "delegated_to": construction_agent.name,
+                        "gap_filling_report": gap_filling_report,
+                    },
+                },
                 self.handler.session_id,
             ),
             CallbackEvent(
@@ -3267,6 +3279,8 @@ class TimeSeriesConstructionProcessor:
                         "delegated_to": reporting_agent.name,
                         "timeseries_csv": csv_path,
                         "timeseries_chart": chart_path,
+                        "timeseries_symbol": (filled_data or {}).get("symbol"),
+                        "gap_filling_method": (filled_data or {}).get("method"),
                     },
                 },
                 self.handler.session_id,
