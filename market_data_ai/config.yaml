@@ -1,0 +1,44 @@
+# Centralised configuration for market_data_ai.
+# Loaded by configuration.py (get_config()).
+
+application:
+  name: market_data_ai
+
+llm:
+  provider: ollama            # active provider: ollama | github | deepseek
+  model: ""                   # optional explicit full model id override (e.g. ollama/qwen2.5:1.5b)
+  temperature: 0.1
+  max_tokens: 2048
+  timeout: 300                # request timeout in seconds (generous for local 16B models)
+  providers:
+    ollama:
+      model: qwen3.5:latest
+      api_base: http://localhost:11434
+    github:
+      model: gpt-4.1
+      # api_key: ""             # GITHUB_TOKEN
+    deepseek:
+      model: deepseek-chat
+      api_base: https://api.deepseek.com
+      # api_key: ""             # DEEPSEEK_API_KEY
+
+paths:
+  app_dir: ~/market_data
+  output_dir: ~/market_data/output
+  database_dir: ~/market_data/db
+  log_dir: ~/market_data/logs
+  data_dir: ~/market_data/data
+  validation_rules: ""        # optional path to validation rules JSON
+
+runtime:
+  agentic_framework: autogen
+  debug_flow: false
+
+dashboard:
+  port: 8501
+  provider_request_timeout: 15.0
+
+data_sources:
+  - yahoo
+  - bloomberg
+  - reuters
